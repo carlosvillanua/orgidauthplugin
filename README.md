@@ -2,6 +2,19 @@
 
 A Traefik middleware plugin for organization-based IP authentication using Redis/Valkey as the backend.
 
+## ⚠️ Disclaimer
+
+This plugin is provided **AS IS** without any warranties or guarantees. It is intended as a reference implementation and **must be adapted and made production-ready for your specific environment**.
+
+**Important Notes:**
+- No binding commitments for updates, bug fixes, or feature enhancements
+- You are responsible for security audits, testing, and validation
+- Adapt configuration, error handling, and logging to your infrastructure
+- Review and modify the fail-open policy according to your security requirements
+- Test thoroughly in non-production environments before deploying
+
+Use at your own risk. The authors are not liable for any issues arising from the use of this plugin.
+
 ## Features
 
 - **IP Allowlist Enforcement**: Validates client IPs against organization-specific allowlists stored in Redis/Valkey
@@ -175,7 +188,7 @@ spec:
     jwt:
       signingSecret: your-jwt-secret
       forwardHeaders:
-        X-Org: "https://api.example.com/organisations"
+        X-Org: "https://api\\.example\\.com/organisations"
 
 # 2. IP Auth Middleware - validates IPs
 ---
@@ -211,26 +224,6 @@ spec:
         - name: jwt-authentication  # First: validate JWT & extract orgs
         - name: orgid-auth          # Second: validate IP for orgs
 ```
-
-## Performance
-
-- **Cache Hit**: ~100μs (in-memory lookup)
-- **Cache Miss**: ~2-5ms (Redis query + IP validation)
-- **Connection Pool**: Reuses connections to minimize overhead
-- **Caching**: Reduces Redis load by 95%+ for repeated requests
-
-## Version History
-
-- **v0.1.1** (2026-01-07): Configuration parsing fix
-  - Fixed duration field parsing from YAML strings
-  - Supports duration formats like "5m", "30s", "2s" in configuration
-  - Improved struct architecture for cleaner code
-
-- **v0.1.0** (2026-01-07): Initial release
-  - Organization-based IP authentication
-  - Redis/Valkey backend support
-  - Connection pooling and caching
-  - Fail-open policy implementation
 
 ## License
 
