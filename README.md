@@ -2,6 +2,19 @@
 
 A Traefik middleware plugin for organization-based IP authentication using Redis/Valkey as the backend.
 
+## ⚠️ Disclaimer
+
+This plugin is provided **AS IS** without any warranties or guarantees. It is intended as a reference implementation and **must be adapted and made production-ready for your specific environment**.
+
+**Important Notes:**
+- No binding commitments for updates, bug fixes, or feature enhancements
+- You are responsible for security audits, testing, and validation
+- Adapt configuration, error handling, and logging to your infrastructure
+- Review and modify the fail-open policy according to your security requirements
+- Test thoroughly in non-production environments before deploying
+
+Use at your own risk. The authors are not liable for any issues arising from the use of this plugin.
+
 ## Features
 
 - **IP Allowlist Enforcement**: Validates client IPs against organization-specific allowlists stored in Redis/Valkey
