@@ -225,13 +225,6 @@ spec:
         - name: orgid-auth          # Second: validate IP for orgs
 ```
 
-## Performance
-
-- **Cache Hit**: ~100μs (in-memory lookup)
-- **Cache Miss**: ~2-5ms (Redis query + IP validation)
-- **Connection Pool**: Reuses connections to minimize overhead
-- **Caching**: Reduces Redis load by 95%+ for repeated requests
-
 ## Version History
 
 - **v0.1.1** (2026-01-07): Configuration parsing fix
