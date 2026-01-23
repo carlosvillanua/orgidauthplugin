@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,6 +85,19 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		config = CreateConfig()
 	}
 
+	// Allow environment variable overrides for sensitive data
+	redisAddr := config.RedisAddr
+	if envAddr := os.Getenv("REDIS_ADDR"); envAddr != "" {
+		redisAddr = envAddr
+		log.Printf("[ORGID-AUTH] Using REDIS_ADDR from environment")
+	}
+
+	redisPassword := config.RedisPassword
+	if envPassword := os.Getenv("REDIS_PASSWORD"); envPassword != "" {
+		redisPassword = envPassword
+		log.Printf("[ORGID-AUTH] Using REDIS_PASSWORD from environment")
+	}
+
 	// Parse duration strings
 	maxConnIdleTime, err := time.ParseDuration(config.MaxConnIdleTime)
 	if err != nil {
@@ -102,8 +116,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 	pool := &ConnectionPool{
 		connections:     make([]*Connection, 0, config.PoolSize),
-		redisAddr:       config.RedisAddr,
-		redisPassword:   config.RedisPassword,
+		redisAddr:       redisAddr,
+		redisPassword:   redisPassword,
 		poolSize:        config.PoolSize,
 		maxConnIdleTime: maxConnIdleTime,
 		poolWaitTimeout: poolWaitTimeout,
