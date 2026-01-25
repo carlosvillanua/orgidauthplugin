@@ -495,8 +495,120 @@ func (o *OrgIDAuth) queryNodeForKeys(nodeAddr, pattern string) []string {
 	return o.redisKeysSingleNode(fd, pattern)
 }
 
-// Redis HGET command
+// Redis HGET command with cluster support
 func (o *OrgIDAuth) redisHGet(fd int, key, field string) string {
+	if !o.clusterMode {
+		return o.redisHGetSingleNode(fd, key, field)
+	}
+	return o.redisHGetCluster(fd, key, field)
+}
+
+// Redis HGET for cluster mode - handles MOVED redirects
+func (o *OrgIDAuth) redisHGetCluster(fd int, key, field string) string {
+	// Try the connected node first
+	cmd := fmt.Sprintf("*3\r\n$4\r\nHGET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(field), field)
+	_, err := syscall.Write(fd, []byte(cmd))
+	if err != nil {
+		return ""
+	}
+
+	buf := make([]byte, 4096)
+	n, err := syscall.Read(fd, buf)
+	if err != nil {
+		return ""
+	}
+
+	response := string(buf[:n])
+
+	// Check for MOVED redirect
+	if strings.HasPrefix(response, "-MOVED") {
+		// Parse MOVED response: -MOVED <slot> <ip:port>
+		parts := strings.Fields(response)
+		if len(parts) >= 3 {
+			targetNode := parts[2]
+			targetNode = strings.TrimSuffix(targetNode, "\r\n")
+
+			// Query the correct node
+			return o.queryNodeForHGet(targetNode, key, field)
+		}
+		return ""
+	}
+
+	// Parse normal response
+	return o.parseHGetResponse(response)
+}
+
+// Query a specific node for HGET
+func (o *OrgIDAuth) queryNodeForHGet(nodeAddr, key, field string) string {
+	// Parse host and port
+	host, portStr, err := net.SplitHostPort(nodeAddr)
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Failed to parse node address %s: %v", nodeAddr, err)
+		return ""
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return ""
+	}
+
+	// Resolve hostname
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		log.Printf("[ORGID-AUTH] Failed to resolve %s: %v", host, err)
+		return ""
+	}
+
+	var ip net.IP
+	for _, i := range ips {
+		if i.To4() != nil {
+			ip = i.To4()
+			break
+		}
+	}
+	if ip == nil {
+		ip = ips[0]
+	}
+
+	// Create socket
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return ""
+	}
+	defer syscall.Close(fd)
+
+	// Connect
+	sa := &syscall.SockaddrInet4{Port: port}
+	copy(sa.Addr[:], ip.To4())
+
+	if err := syscall.Connect(fd, sa); err != nil {
+		log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
+		return ""
+	}
+
+	// Authenticate if needed
+	if o.pool.redisPassword != "" {
+		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
+		_, err = syscall.Write(fd, []byte(authCmd))
+		if err != nil {
+			return ""
+		}
+
+		// Read auth response
+		buf := make([]byte, 1024)
+		n, err := syscall.Read(fd, buf)
+		if err != nil || !strings.Contains(string(buf[:n]), "+OK") {
+			log.Printf("[ORGID-AUTH] Auth failed for node %s", nodeAddr)
+			return ""
+		}
+	}
+
+	// Execute HGET
+	return o.redisHGetSingleNode(fd, key, field)
+}
+
+// Redis HGET for single node
+func (o *OrgIDAuth) redisHGetSingleNode(fd int, key, field string) string {
 	cmd := fmt.Sprintf("*3\r\n$4\r\nHGET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(field), field)
 	_, err := syscall.Write(fd, []byte(cmd))
 	if err != nil {
@@ -510,23 +622,28 @@ func (o *OrgIDAuth) redisHGet(fd int, key, field string) string {
 		return ""
 	}
 
-	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
-	response, err := reader.ReadString('\n')
+	return o.parseHGetResponse(string(buf[:n]))
+}
+
+// Parse HGET response (bulk string format)
+func (o *OrgIDAuth) parseHGetResponse(response string) string {
+	reader := bufio.NewReader(bytes.NewReader([]byte(response)))
+	firstLine, err := reader.ReadString('\n')
 	if err != nil {
 		return ""
 	}
 
 	// Parse bulk string response
-	response = strings.TrimSpace(response)
-	if strings.HasPrefix(response, "$-1") {
+	firstLine = strings.TrimSpace(firstLine)
+	if strings.HasPrefix(firstLine, "$-1") {
 		return "" // nil response
 	}
-	if !strings.HasPrefix(response, "$") {
+	if !strings.HasPrefix(firstLine, "$") {
 		return ""
 	}
 
 	// Parse length
-	lengthStr := response[1:]
+	lengthStr := firstLine[1:]
 	length, err := strconv.Atoi(lengthStr)
 	if err != nil || length < 0 {
 		return ""
