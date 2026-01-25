@@ -24,6 +24,7 @@ type Config struct {
 	PoolWaitTimeout  string `json:"poolWaitTimeout,omitempty"`
 	CacheTTL         string `json:"cacheTTL,omitempty"`
 	CacheMaxSize     int    `json:"cacheMaxSize,omitempty"`
+	ClusterMode      bool   `json:"clusterMode,omitempty"`
 }
 
 func CreateConfig() *Config {
@@ -36,6 +37,7 @@ func CreateConfig() *Config {
 		PoolWaitTimeout: "2s",
 		CacheTTL:        "30s",
 		CacheMaxSize:    1000,
+		ClusterMode:     false,
 	}
 }
 
@@ -72,11 +74,12 @@ type IPCache struct {
 }
 
 type OrgIDAuth struct {
-	next      http.Handler
-	orgHeader string
-	name      string
-	pool      *ConnectionPool
-	cache     *IPCache
+	next        http.Handler
+	orgHeader   string
+	name        string
+	pool        *ConnectionPool
+	cache       *IPCache
+	clusterMode bool
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
@@ -116,11 +119,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	return &OrgIDAuth{
-		next:      next,
-		orgHeader: config.OrgHeader,
-		name:      name,
-		pool:      pool,
-		cache:     cache,
+		next:        next,
+		orgHeader:   config.OrgHeader,
+		name:        name,
+		pool:        pool,
+		cache:       cache,
+		clusterMode: config.ClusterMode,
 	}, nil
 }
 
@@ -251,8 +255,19 @@ func (o *OrgIDAuth) isIPAllowedForOrg(orgID, clientIP string) (bool, bool) {
 	return false, true // Cache this result (IP not in list)
 }
 
-// Redis KEYS command
+// Redis KEYS command with cluster support
 func (o *OrgIDAuth) redisKeys(fd int, pattern string) []string {
+	if !o.clusterMode {
+		// Single node mode - use current implementation
+		return o.redisKeysSingleNode(fd, pattern)
+	}
+
+	// Cluster mode - query all nodes
+	return o.redisKeysCluster(fd, pattern)
+}
+
+// Redis KEYS command for single node
+func (o *OrgIDAuth) redisKeysSingleNode(fd int, pattern string) []string {
 	cmd := fmt.Sprintf("*2\r\n$4\r\nKEYS\r\n$%d\r\n%s\r\n", len(pattern), pattern)
 	_, err := syscall.Write(fd, []byte(cmd))
 	if err != nil {
@@ -319,6 +334,165 @@ func (o *OrgIDAuth) redisKeys(fd int, pattern string) []string {
 	}
 
 	return keys
+}
+
+// Redis KEYS command for cluster mode - queries all nodes
+func (o *OrgIDAuth) redisKeysCluster(fd int, pattern string) []string {
+	// Get all cluster nodes
+	nodes := o.getClusterNodes(fd)
+	if len(nodes) == 0 {
+		log.Printf("[ORGID-AUTH] WARNING: Could not get cluster nodes, falling back to single node")
+		return o.redisKeysSingleNode(fd, pattern)
+	}
+
+	log.Printf("[ORGID-AUTH] Cluster mode: querying %d nodes for pattern %s", len(nodes), pattern)
+
+	// Query each node and aggregate results
+	allKeys := make(map[string]bool)
+	for _, nodeAddr := range nodes {
+		nodeKeys := o.queryNodeForKeys(nodeAddr, pattern)
+		for _, key := range nodeKeys {
+			allKeys[key] = true
+		}
+	}
+
+	// Convert map to slice
+	keys := make([]string, 0, len(allKeys))
+	for key := range allKeys {
+		keys = append(keys, key)
+	}
+
+	log.Printf("[ORGID-AUTH] Cluster mode: found %d unique keys across all nodes", len(keys))
+	return keys
+}
+
+// Get all cluster node addresses
+func (o *OrgIDAuth) getClusterNodes(fd int) []string {
+	cmd := "*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n"
+	_, err := syscall.Write(fd, []byte(cmd))
+	if err != nil {
+		return nil
+	}
+
+	// Read response
+	buf := make([]byte, 16384)
+	n, err := syscall.Read(fd, buf)
+	if err != nil {
+		return nil
+	}
+
+	response := string(buf[:n])
+
+	// Parse CLUSTER NODES response
+	// Format: $<length>\r\n<data>\r\n
+	if !strings.HasPrefix(response, "$") {
+		return nil
+	}
+
+	lines := strings.Split(response, "\r\n")
+	if len(lines) < 2 {
+		return nil
+	}
+
+	// Skip first line ($length) and last line (empty)
+	nodesData := lines[1]
+
+	// Parse each node line
+	// Format: <id> <ip:port@cport> <flags> <master> <ping-sent> <pong-recv> <config-epoch> <link-state> <slot> <slot> ... <slot>
+	nodeLines := strings.Split(nodesData, "\n")
+	var nodes []string
+
+	for _, line := range nodeLines {
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 8 {
+			continue
+		}
+
+		// Extract IP:port from field[1] (format: ip:port@cport)
+		addrParts := strings.Split(fields[1], "@")
+		if len(addrParts) > 0 {
+			addr := addrParts[0]
+			// Only include master nodes or standalone nodes
+			if !strings.Contains(fields[2], "slave") {
+				nodes = append(nodes, addr)
+			}
+		}
+	}
+
+	return nodes
+}
+
+// Query a specific node for keys matching pattern
+func (o *OrgIDAuth) queryNodeForKeys(nodeAddr, pattern string) []string {
+	// Parse host and port
+	host, portStr, err := net.SplitHostPort(nodeAddr)
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Failed to parse node address %s: %v", nodeAddr, err)
+		return nil
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil
+	}
+
+	// Resolve hostname
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		log.Printf("[ORGID-AUTH] Failed to resolve %s: %v", host, err)
+		return nil
+	}
+
+	var ip net.IP
+	for _, i := range ips {
+		if i.To4() != nil {
+			ip = i.To4()
+			break
+		}
+	}
+	if ip == nil {
+		ip = ips[0]
+	}
+
+	// Create socket
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil
+	}
+	defer syscall.Close(fd)
+
+	// Connect
+	sa := &syscall.SockaddrInet4{Port: port}
+	copy(sa.Addr[:], ip.To4())
+
+	if err := syscall.Connect(fd, sa); err != nil {
+		log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
+		return nil
+	}
+
+	// Authenticate if needed
+	if o.pool.redisPassword != "" {
+		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
+		_, err = syscall.Write(fd, []byte(authCmd))
+		if err != nil {
+			return nil
+		}
+
+		// Read auth response
+		buf := make([]byte, 1024)
+		n, err := syscall.Read(fd, buf)
+		if err != nil || !strings.Contains(string(buf[:n]), "+OK") {
+			log.Printf("[ORGID-AUTH] Auth failed for node %s", nodeAddr)
+			return nil
+		}
+	}
+
+	// Execute KEYS command
+	return o.redisKeysSingleNode(fd, pattern)
 }
 
 // Redis HGET command
