@@ -426,25 +426,21 @@ func (o *OrgIDAuth) getClusterNodes(fd int) []string {
 	return nodes
 }
 
-// Query a specific node for keys matching pattern
-func (o *OrgIDAuth) queryNodeForKeys(nodeAddr, pattern string) []string {
-	// Parse host and port
+// connectToNode creates an authenticated connection to a specific cluster node
+func (o *OrgIDAuth) connectToNode(nodeAddr string) (int, error) {
 	host, portStr, err := net.SplitHostPort(nodeAddr)
 	if err != nil {
-		log.Printf("[ORGID-AUTH] Failed to parse node address %s: %v", nodeAddr, err)
-		return nil
+		return -1, fmt.Errorf("parse address: %v", err)
 	}
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return nil
+		return -1, err
 	}
 
-	// Resolve hostname
 	ips, err := net.LookupIP(host)
 	if err != nil || len(ips) == 0 {
-		log.Printf("[ORGID-AUTH] Failed to resolve %s: %v", host, err)
-		return nil
+		return -1, fmt.Errorf("resolve %s: %v", host, err)
 	}
 
 	var ip net.IP
@@ -458,40 +454,47 @@ func (o *OrgIDAuth) queryNodeForKeys(nodeAddr, pattern string) []string {
 		ip = ips[0]
 	}
 
-	// Create socket
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
 	if err != nil {
-		return nil
+		return -1, err
 	}
-	defer syscall.Close(fd)
 
-	// Connect
 	sa := &syscall.SockaddrInet4{Port: port}
 	copy(sa.Addr[:], ip.To4())
 
 	if err := syscall.Connect(fd, sa); err != nil {
-		log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
-		return nil
+		syscall.Close(fd)
+		return -1, fmt.Errorf("connect: %v", err)
 	}
 
 	// Authenticate if needed
 	if o.pool.redisPassword != "" {
 		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
-		_, err = syscall.Write(fd, []byte(authCmd))
-		if err != nil {
-			return nil
+		if _, err = syscall.Write(fd, []byte(authCmd)); err != nil {
+			syscall.Close(fd)
+			return -1, err
 		}
 
-		// Read auth response
 		buf := make([]byte, 1024)
 		n, err := syscall.Read(fd, buf)
 		if err != nil || !strings.Contains(string(buf[:n]), "+OK") {
-			log.Printf("[ORGID-AUTH] Auth failed for node %s", nodeAddr)
-			return nil
+			syscall.Close(fd)
+			return -1, fmt.Errorf("auth failed")
 		}
 	}
 
-	// Execute KEYS command
+	return fd, nil
+}
+
+// Query a specific node for keys matching pattern
+func (o *OrgIDAuth) queryNodeForKeys(nodeAddr, pattern string) []string {
+	fd, err := o.connectToNode(nodeAddr)
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
+		return nil
+	}
+	defer syscall.Close(fd)
+
 	return o.redisKeysSingleNode(fd, pattern)
 }
 
@@ -540,70 +543,13 @@ func (o *OrgIDAuth) redisHGetCluster(fd int, key, field string) string {
 
 // Query a specific node for HGET
 func (o *OrgIDAuth) queryNodeForHGet(nodeAddr, key, field string) string {
-	// Parse host and port
-	host, portStr, err := net.SplitHostPort(nodeAddr)
+	fd, err := o.connectToNode(nodeAddr)
 	if err != nil {
-		log.Printf("[ORGID-AUTH] Failed to parse node address %s: %v", nodeAddr, err)
-		return ""
-	}
-
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return ""
-	}
-
-	// Resolve hostname
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		log.Printf("[ORGID-AUTH] Failed to resolve %s: %v", host, err)
-		return ""
-	}
-
-	var ip net.IP
-	for _, i := range ips {
-		if i.To4() != nil {
-			ip = i.To4()
-			break
-		}
-	}
-	if ip == nil {
-		ip = ips[0]
-	}
-
-	// Create socket
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
-	if err != nil {
+		log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
 		return ""
 	}
 	defer syscall.Close(fd)
 
-	// Connect
-	sa := &syscall.SockaddrInet4{Port: port}
-	copy(sa.Addr[:], ip.To4())
-
-	if err := syscall.Connect(fd, sa); err != nil {
-		log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
-		return ""
-	}
-
-	// Authenticate if needed
-	if o.pool.redisPassword != "" {
-		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
-		_, err = syscall.Write(fd, []byte(authCmd))
-		if err != nil {
-			return ""
-		}
-
-		// Read auth response
-		buf := make([]byte, 1024)
-		n, err := syscall.Read(fd, buf)
-		if err != nil || !strings.Contains(string(buf[:n]), "+OK") {
-			log.Printf("[ORGID-AUTH] Auth failed for node %s", nodeAddr)
-			return ""
-		}
-	}
-
-	// Execute HGET
 	return o.redisHGetSingleNode(fd, key, field)
 }
 
