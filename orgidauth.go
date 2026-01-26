@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -231,12 +230,43 @@ func (o *OrgIDAuth) isIPAllowedForOrg(orgID, clientIP string) (bool, bool) {
 		return true, true // Cache this result
 	}
 
-	// Check if IP exists in the set using SISMEMBER
+	// First try exact IP match (fast path)
 	if o.redisSIsMember(conn.fd, key, clientIP) {
 		return true, true // IP found in set, allow access
 	}
 
-	return false, true // Cache this result (IP not in list)
+	// If no exact match, check CIDR blocks
+	members := o.redisSMembers(conn.fd, key)
+	if members == nil {
+		// Error fetching members
+		connFailed = true
+		log.Printf("[ORGID-AUTH] WARNING: Failed to fetch members for org %s - fail-open: allowing access", orgID)
+		return true, false
+	}
+
+	// Parse client IP
+	clientIPParsed := net.ParseIP(clientIP)
+	if clientIPParsed == nil {
+		log.Printf("[ORGID-AUTH] Invalid client IP format: %s", clientIP)
+		return false, true
+	}
+
+	// Check if client IP matches any CIDR block
+	for _, member := range members {
+		if strings.Contains(member, "/") {
+			// It's a CIDR block
+			_, ipnet, err := net.ParseCIDR(member)
+			if err != nil {
+				log.Printf("[ORGID-AUTH] Invalid CIDR format in Redis: %s", member)
+				continue
+			}
+			if ipnet.Contains(clientIPParsed) {
+				return true, true // IP matches CIDR block
+			}
+		}
+	}
+
+	return false, true // Cache this result (IP not in list or CIDR ranges)
 }
 
 // Redis KEYS command with cluster support
@@ -566,6 +596,177 @@ func (o *OrgIDAuth) redisSIsMemberSingleNode(fd int, key, member string) bool {
 	// Parse response (should be ":1" for member exists, ":0" for doesn't exist)
 	response = strings.TrimSpace(response)
 	return response == ":1"
+}
+
+// Redis SMEMBERS command with cluster support
+func (o *OrgIDAuth) redisSMembers(fd int, key string) []string {
+	if !o.clusterMode {
+		return o.redisSMembersSingleNode(fd, key)
+	}
+	return o.redisSMembersCluster(fd, key)
+}
+
+// Redis SMEMBERS for single node
+func (o *OrgIDAuth) redisSMembersSingleNode(fd int, key string) []string {
+	cmd := fmt.Sprintf("*2\r\n$8\r\nSMEMBERS\r\n$%d\r\n%s\r\n", len(key), key)
+	_, err := syscall.Write(fd, []byte(cmd))
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error writing SMEMBERS command: %v", err)
+		return nil
+	}
+
+	// Read response using syscall.Read to avoid FD ownership issues
+	buf := make([]byte, 8192) // Larger buffer for multiple members
+	n, err := syscall.Read(fd, buf)
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error reading SMEMBERS response: %v", err)
+		return nil
+	}
+
+	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error parsing SMEMBERS response: %v", err)
+		return nil
+	}
+
+	// Parse array response
+	response = strings.TrimSpace(response)
+	if !strings.HasPrefix(response, "*") {
+		return nil
+	}
+
+	countStr := response[1:]
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		return nil
+	}
+	if count == 0 {
+		return []string{}
+	}
+
+	members := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		// Read bulk string length line
+		lenLine, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		lenLine = strings.TrimSpace(lenLine)
+		if !strings.HasPrefix(lenLine, "$") {
+			continue
+		}
+
+		// Parse length
+		lengthStr := lenLine[1:]
+		length, err := strconv.Atoi(lengthStr)
+		if err != nil || length < 0 {
+			continue
+		}
+
+		// Read exact number of bytes + \r\n
+		memberBytes := make([]byte, length+2)
+		_, err = reader.Read(memberBytes)
+		if err != nil {
+			break
+		}
+
+		// Extract member (without \r\n)
+		member := string(memberBytes[:length])
+		members = append(members, member)
+	}
+
+	return members
+}
+
+// Redis SMEMBERS for cluster mode - handles MOVED redirects
+func (o *OrgIDAuth) redisSMembersCluster(fd int, key string) []string {
+	cmd := fmt.Sprintf("*2\r\n$8\r\nSMEMBERS\r\n$%d\r\n%s\r\n", len(key), key)
+	_, err := syscall.Write(fd, []byte(cmd))
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error writing SMEMBERS command: %v", err)
+		return nil
+	}
+
+	// Read response using syscall.Read to avoid FD ownership issues
+	buf := make([]byte, 8192)
+	n, err := syscall.Read(fd, buf)
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error reading SMEMBERS response: %v", err)
+		return nil
+	}
+
+	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error parsing SMEMBERS response: %v", err)
+		return nil
+	}
+
+	// Check for MOVED redirect
+	if strings.HasPrefix(response, "-MOVED") {
+		// Extract new node address from MOVED response
+		parts := strings.Fields(response)
+		if len(parts) >= 3 {
+			nodeAddr := parts[2]
+			// Connect to the new node and retry
+			nodeFd, err := o.connectToNode(nodeAddr)
+			if err != nil {
+				log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
+				return nil
+			}
+			defer syscall.Close(nodeFd)
+			return o.redisSMembersSingleNode(nodeFd, key)
+		}
+	}
+
+	// Parse array response
+	response = strings.TrimSpace(response)
+	if !strings.HasPrefix(response, "*") {
+		return nil
+	}
+
+	countStr := response[1:]
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		return nil
+	}
+	if count == 0 {
+		return []string{}
+	}
+
+	members := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		// Read bulk string length line
+		lenLine, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		lenLine = strings.TrimSpace(lenLine)
+		if !strings.HasPrefix(lenLine, "$") {
+			continue
+		}
+
+		// Parse length
+		lengthStr := lenLine[1:]
+		length, err := strconv.Atoi(lengthStr)
+		if err != nil || length < 0 {
+			continue
+		}
+
+		// Read exact number of bytes + \r\n
+		memberBytes := make([]byte, length+2)
+		_, err = reader.Read(memberBytes)
+		if err != nil {
+			break
+		}
+
+		// Extract member (without \r\n)
+		member := string(memberBytes[:length])
+		members = append(members, member)
+	}
+
+	return members
 }
 
 // Redis EXISTS command with cluster support
