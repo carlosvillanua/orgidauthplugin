@@ -501,11 +501,18 @@ func (o *OrgIDAuth) redisSIsMemberCluster(fd int, key, member string) bool {
 		return false
 	}
 
-	// Read response
-	reader := bufio.NewReader(os.NewFile(uintptr(fd), "redis-conn"))
-	response, err := reader.ReadString('\n')
+	// Read response using syscall.Read to avoid FD ownership issues
+	buf := make([]byte, 1024)
+	n, err := syscall.Read(fd, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading SISMEMBER response: %v", err)
+		return false
+	}
+
+	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error parsing SISMEMBER response: %v", err)
 		return false
 	}
 
@@ -541,11 +548,18 @@ func (o *OrgIDAuth) redisSIsMemberSingleNode(fd int, key, member string) bool {
 		return false
 	}
 
-	// Read response
-	reader := bufio.NewReader(os.NewFile(uintptr(fd), "redis-conn"))
-	response, err := reader.ReadString('\n')
+	// Read response using syscall.Read to avoid FD ownership issues
+	buf := make([]byte, 1024)
+	n, err := syscall.Read(fd, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading SISMEMBER response: %v", err)
+		return false
+	}
+
+	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error parsing SISMEMBER response: %v", err)
 		return false
 	}
 
@@ -572,11 +586,18 @@ func (o *OrgIDAuth) redisExistsSingleNode(fd int, key string) int {
 		return -1
 	}
 
-	// Read response
-	reader := bufio.NewReader(os.NewFile(uintptr(fd), "redis-conn"))
-	response, err := reader.ReadString('\n')
+	// Read response using syscall.Read to avoid FD ownership issues
+	buf := make([]byte, 1024)
+	n, err := syscall.Read(fd, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading EXISTS response: %v", err)
+		return -1
+	}
+
+	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error parsing EXISTS response: %v", err)
 		return -1
 	}
 
@@ -600,11 +621,18 @@ func (o *OrgIDAuth) redisExistsCluster(fd int, key string) int {
 		return -1
 	}
 
-	// Read response
-	reader := bufio.NewReader(os.NewFile(uintptr(fd), "redis-conn"))
-	response, err := reader.ReadString('\n')
+	// Read response using syscall.Read to avoid FD ownership issues
+	buf := make([]byte, 1024)
+	n, err := syscall.Read(fd, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading EXISTS response: %v", err)
+		return -1
+	}
+
+	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error parsing EXISTS response: %v", err)
 		return -1
 	}
 
