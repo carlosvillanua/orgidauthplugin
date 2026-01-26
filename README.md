@@ -17,6 +17,7 @@ Use at your own risk. No warranties or support commitments.
 ## Features
 
 - **IP Allowlist Enforcement**: Validates client IPs against org-specific allowlists in Redis/Valkey
+- **CIDR Block Support**: Supports both individual IPs and CIDR notation (e.g., `10.0.0.0/24`)
 - **Multi-Organization Support**: Allows access if ANY organization permits the client IP
 - **Redis Cluster Support**: Full cluster support with automatic node discovery and routing
 - **Fail-Open Policy**: Allows requests when Redis is unavailable or org doesn't exist
@@ -33,7 +34,7 @@ Use at your own risk. No warranties or support commitments.
 helm upgrade traefik traefik/traefik -n traefik --wait \
   --reuse-values \
   --set experimental.plugins.orgidauthplugin.moduleName=github.com/carlosvillanua/orgidauthplugin \
-  --set experimental.plugins.orgidauthplugin.version=v0.1.5
+  --set experimental.plugins.orgidauthplugin.version=v0.1.9
 ```
 
 **Static Config (`traefik.yml`):**
@@ -42,7 +43,7 @@ experimental:
   plugins:
     orgidauthplugin:
       moduleName: github.com/carlosvillanua/orgidauthplugin
-      version: v0.1.5
+      version: v0.1.9
 ```
 
 ### 2. Create Middleware
@@ -127,27 +128,43 @@ spec:
 ```bash
 # Pattern: uuid:{orgID}:allowed
 # Type: SET
-# Members: IP addresses
+# Members: Individual IPs or CIDR blocks
 
+# Individual IPs
 SADD "uuid:org-123:allowed" "10.0.1.5"
 SADD "uuid:org-123:allowed" "192.168.1.100"
+
+# CIDR blocks
+SADD "uuid:org-123:allowed" "10.42.0.0/16"
+SADD "uuid:org-123:allowed" "192.168.0.0/24"
+
+# Mixed (both IPs and CIDRs)
+SADD "uuid:org-456:allowed" "172.16.50.100" "10.0.0.0/8" "192.168.1.0/24"
 ```
 
 **Managing Allowlists:**
 ```bash
-# Add IPs to allowlist
+# Add individual IPs to allowlist
 kubectl exec -n traefik redis-0 -- redis-cli -a password \
   SADD "uuid:org-123:allowed" "10.0.1.5" "192.168.1.100"
 
-# View all allowed IPs
+# Add CIDR blocks to allowlist
+kubectl exec -n traefik redis-0 -- redis-cli -a password \
+  SADD "uuid:org-123:allowed" "10.42.0.0/16" "192.168.0.0/24"
+
+# Add mixed (IPs and CIDRs)
+kubectl exec -n traefik redis-0 -- redis-cli -a password \
+  SADD "uuid:org-123:allowed" "172.16.50.100" "10.0.0.0/8"
+
+# View all allowed IPs/CIDRs
 kubectl exec -n traefik redis-0 -- redis-cli -a password \
   SMEMBERS "uuid:org-123:allowed"
 
-# Check if IP is allowed
+# Check if specific IP is allowed (exact match only)
 kubectl exec -n traefik redis-0 -- redis-cli -a password \
   SISMEMBER "uuid:org-123:allowed" "10.0.1.5"
 
-# Remove IP from allowlist
+# Remove IP or CIDR from allowlist
 kubectl exec -n traefik redis-0 -- redis-cli -a password \
   SREM "uuid:org-123:allowed" "10.0.1.5"
 
@@ -163,9 +180,10 @@ kubectl exec -n traefik redis-0 -- redis-cli -a password \
 3. **For each org ID**:
    - Check in-memory cache
    - Check if Redis key `uuid:{orgID}:allowed` exists
-   - Use `SISMEMBER` to check if client IP is in the allowlist SET
+   - **Fast path**: Use `SISMEMBER` to check exact IP match
+   - **CIDR path**: If no exact match, fetch all members with `SMEMBERS` and check CIDR ranges
 4. **Decision**:
-   - ✅ Allow if ANY org permits the IP
+   - ✅ Allow if ANY org permits the IP (exact match or CIDR range)
    - ✅ Allow if org not in Redis (fail-open)
    - ✅ Allow if Redis unavailable (fail-open)
    - ❌ Deny if org exists but IP not allowed
@@ -176,6 +194,19 @@ kubectl exec -n traefik redis-0 -- redis-cli -a password \
 - WARNING for Redis failures (fail-open)
 
 ## Version History
+
+### v0.1.9 (2026-01-26)
+- Added CIDR block support for IP allowlists
+- Implemented SMEMBERS command for single node and cluster mode
+- Supports mixed allowlists with both individual IPs and CIDR ranges
+- Fast path for exact IP matches, fallback to CIDR checking
+- Feature parity with Traefik's built-in IPAllowList middleware
+
+### v0.1.8 (2026-01-26)
+- Fixed critical FD ownership bug causing Redis protocol leaks into HTTP responses
+- Replaced os.NewFile() with direct syscall.Read() to prevent FD reuse issues
+- Resolves "Unsolicited response received on idle HTTP channel" errors under load
+- Stable performance at 300+ req/s with zero errors
 
 ### v0.1.7 (2026-01-26)
 - Simplified key pattern to `uuid:{orgID}:allowed` for better performance
