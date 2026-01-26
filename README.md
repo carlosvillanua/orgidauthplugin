@@ -115,37 +115,45 @@ spec:
 ```
 
 **How it works:**
-- Discovers all master nodes via `CLUSTER NODES`
-- Queries all nodes with `KEYS` command
-- Handles `MOVED` redirects for reading values
-- Aggregates results across all shards
+- Handles `MOVED` redirects for `EXISTS` and `SISMEMBER` commands
+- Automatically routes requests to the correct cluster node
+- Ensures consistent key lookup across cluster shards
 
-**⚠️ Important:** Without `clusterMode: true`, only keys on the connected node are visible, causing fail-open for other orgs.
+**⚠️ Important:** Without `clusterMode: true`, `MOVED` redirects are not handled, which may cause errors when keys are on different nodes.
 
 ## Redis Data Management
 
 **Data Structure:**
 ```bash
-# Pattern: uuid:{orgID}:{env}
-# Field: ips
-# Value: space-separated IPs
+# Pattern: uuid:{orgID}:allowed
+# Type: SET
+# Members: IP addresses
 
-HSET "uuid:org-123:prod" ips "10.0.1.5 192.168.1.100"
+SADD "uuid:org-123:allowed" "10.0.1.5"
+SADD "uuid:org-123:allowed" "192.168.1.100"
 ```
 
 **Managing Allowlists:**
 ```bash
-# Add/update IPs
+# Add IPs to allowlist
 kubectl exec -n traefik redis-0 -- redis-cli -a password \
-  HSET "uuid:org-123:prod" ips "10.0.1.5 192.168.1.100"
+  SADD "uuid:org-123:allowed" "10.0.1.5" "192.168.1.100"
 
-# View IPs
+# View all allowed IPs
 kubectl exec -n traefik redis-0 -- redis-cli -a password \
-  HGET "uuid:org-123:prod" ips
+  SMEMBERS "uuid:org-123:allowed"
 
-# Remove org
+# Check if IP is allowed
 kubectl exec -n traefik redis-0 -- redis-cli -a password \
-  DEL "uuid:org-123:prod"
+  SISMEMBER "uuid:org-123:allowed" "10.0.1.5"
+
+# Remove IP from allowlist
+kubectl exec -n traefik redis-0 -- redis-cli -a password \
+  SREM "uuid:org-123:allowed" "10.0.1.5"
+
+# Remove entire allowlist
+kubectl exec -n traefik redis-0 -- redis-cli -a password \
+  DEL "uuid:org-123:allowed"
 ```
 
 ## How It Works
@@ -154,8 +162,8 @@ kubectl exec -n traefik redis-0 -- redis-cli -a password \
 2. **Plugin extracts** client IP from `X-Forwarded-For`, `X-Real-IP`, or `RemoteAddr`
 3. **For each org ID**:
    - Check in-memory cache
-   - Query Redis for `uuid:{orgID}:*` keys
-   - Check if client IP is in allowlist
+   - Check if Redis key `uuid:{orgID}:allowed` exists
+   - Use `SISMEMBER` to check if client IP is in the allowlist SET
 4. **Decision**:
    - ✅ Allow if ANY org permits the IP
    - ✅ Allow if org not in Redis (fail-open)
@@ -168,6 +176,12 @@ kubectl exec -n traefik redis-0 -- redis-cli -a password \
 - WARNING for Redis failures (fail-open)
 
 ## Version History
+
+### v0.1.7 (2026-01-26)
+- Simplified key pattern to `uuid:{orgID}:allowed` for better performance
+- Replaced KEYS pattern search with direct EXISTS + SISMEMBER lookups
+- Added cluster support for EXISTS command with MOVED redirect handling
+- Significantly improved Redis operation efficiency
 
 ### v0.1.5 (2026-01-25)
 - Refactored cluster connection logic

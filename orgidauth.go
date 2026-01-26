@@ -213,29 +213,27 @@ func (o *OrgIDAuth) isIPAllowedForOrg(orgID, clientIP string) (bool, bool) {
 		}
 	}()
 
-	// Get keys matching pattern for UUID organizations: uuid:{orgID}:*
-	pattern := fmt.Sprintf("uuid:%s:*", orgID)
-	keys := o.redisKeys(conn.fd, pattern)
+	// Build the key for this org's allowed IPs set
+	key := fmt.Sprintf("uuid:%s:allowed", orgID)
+
+	// Check if the key exists first
+	exists := o.redisExists(conn.fd, key)
 
 	// Check if Redis command failed (connection issue)
-	if keys == nil && pattern != "" {
+	if exists < 0 {
 		connFailed = true
 		log.Printf("[ORGID-AUTH] WARNING: Redis unavailable for org %s - fail-open: allowing access", orgID)
 		return true, false // Fail-open: allow access on connection failures, but don't cache
 	}
 
-	if len(keys) == 0 {
-		// Fail-open policy: allow requests when org ID not found in Valkey
+	if exists == 0 {
+		// Fail-open policy: allow requests when org ID not found in Redis
 		return true, true // Cache this result
 	}
 
-	// Check each key for matching IPs using SISMEMBER
-	for _, key := range keys {
-		// Use SISMEMBER to check if IP exists in the set
-		// Key pattern is expected to be org:123:ips for the set
-		if o.redisSIsMember(conn.fd, key, clientIP) {
-			return true, true // IP found in set, allow access
-		}
+	// Check if IP exists in the set using SISMEMBER
+	if o.redisSIsMember(conn.fd, key, clientIP) {
+		return true, true // IP found in set, allow access
 	}
 
 	return false, true // Cache this result (IP not in list)
@@ -554,6 +552,88 @@ func (o *OrgIDAuth) redisSIsMemberSingleNode(fd int, key, member string) bool {
 	// Parse response (should be ":1" for member exists, ":0" for doesn't exist)
 	response = strings.TrimSpace(response)
 	return response == ":1"
+}
+
+// Redis EXISTS command with cluster support
+// Returns: 1 if key exists, 0 if not exists, -1 on error
+func (o *OrgIDAuth) redisExists(fd int, key string) int {
+	if !o.clusterMode {
+		return o.redisExistsSingleNode(fd, key)
+	}
+	return o.redisExistsCluster(fd, key)
+}
+
+// Redis EXISTS for single node
+func (o *OrgIDAuth) redisExistsSingleNode(fd int, key string) int {
+	cmd := fmt.Sprintf("*2\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key)
+	_, err := syscall.Write(fd, []byte(cmd))
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error writing EXISTS command: %v", err)
+		return -1
+	}
+
+	// Read response
+	reader := bufio.NewReader(os.NewFile(uintptr(fd), "redis-conn"))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error reading EXISTS response: %v", err)
+		return -1
+	}
+
+	// Parse response (should be ":1" for exists, ":0" for doesn't exist)
+	response = strings.TrimSpace(response)
+	if response == ":1" {
+		return 1
+	} else if response == ":0" {
+		return 0
+	}
+
+	return -1 // Parse error
+}
+
+// Redis EXISTS for cluster mode - handles MOVED redirects
+func (o *OrgIDAuth) redisExistsCluster(fd int, key string) int {
+	cmd := fmt.Sprintf("*2\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key)
+	_, err := syscall.Write(fd, []byte(cmd))
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error writing EXISTS command: %v", err)
+		return -1
+	}
+
+	// Read response
+	reader := bufio.NewReader(os.NewFile(uintptr(fd), "redis-conn"))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("[ORGID-AUTH] Error reading EXISTS response: %v", err)
+		return -1
+	}
+
+	// Check for MOVED redirect
+	if strings.HasPrefix(response, "-MOVED") {
+		// Extract new node address from MOVED response
+		parts := strings.Fields(response)
+		if len(parts) >= 3 {
+			nodeAddr := parts[2]
+			// Connect to the new node and retry
+			nodeFd, err := o.connectToNode(nodeAddr)
+			if err != nil {
+				log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
+				return -1
+			}
+			defer syscall.Close(nodeFd)
+			return o.redisExistsSingleNode(nodeFd, key)
+		}
+	}
+
+	// Parse response (should be ":1" for exists, ":0" for doesn't exist)
+	response = strings.TrimSpace(response)
+	if response == ":1" {
+		return 1
+	} else if response == ":0" {
+		return 0
+	}
+
+	return -1 // Parse error
 }
 
 // getClientIP implements Traefik's IP detection logic
