@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,15 +17,15 @@ import (
 )
 
 type Config struct {
-	RedisAddr        string `json:"redisAddr,omitempty"`
-	RedisPassword    string `json:"redisPassword,omitempty"`
-	OrgHeader        string `json:"orgHeader,omitempty"`
-	PoolSize         int    `json:"poolSize,omitempty"`
-	MaxConnIdleTime  string `json:"maxConnIdleTime,omitempty"`
-	PoolWaitTimeout  string `json:"poolWaitTimeout,omitempty"`
-	CacheTTL         string `json:"cacheTTL,omitempty"`
-	CacheMaxSize     int    `json:"cacheMaxSize,omitempty"`
-	ClusterMode      bool   `json:"clusterMode,omitempty"`
+	RedisAddr       string `json:"redisAddr,omitempty"`
+	RedisPassword   string `json:"redisPassword,omitempty"`
+	OrgHeader       string `json:"orgHeader,omitempty"`
+	PoolSize        int    `json:"poolSize,omitempty"`
+	MaxConnIdleTime string `json:"maxConnIdleTime,omitempty"`
+	PoolWaitTimeout string `json:"poolWaitTimeout,omitempty"`
+	CacheTTL        string `json:"cacheTTL,omitempty"`
+	CacheMaxSize    int    `json:"cacheMaxSize,omitempty"`
+	ClusterMode     bool   `json:"clusterMode,omitempty"`
 }
 
 func CreateConfig() *Config {
@@ -134,7 +135,7 @@ func (o *OrgIDAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Get all X-Org headers sent by JWT middleware (can be multiple headers)
 	orgHeaders := req.Header.Values(o.orgHeader)
 	var orgIDs []string
-	
+
 	// Process each X-Org header
 	for _, orgHeader := range orgHeaders {
 		if orgHeader != "" {
@@ -228,27 +229,12 @@ func (o *OrgIDAuth) isIPAllowedForOrg(orgID, clientIP string) (bool, bool) {
 		return true, true // Cache this result
 	}
 
-	// Check each key for matching IPs
+	// Check each key for matching IPs using SISMEMBER
 	for _, key := range keys {
-		ipsStr := o.redisHGet(conn.fd, key, "ips")
-
-		// Note: Empty string is valid (field doesn't exist), but we can't distinguish
-		// from connection failure without changing redisHGet signature
-		if ipsStr == "" {
-			continue
-		}
-
-		// Parse IPs from string format [ip1 ip2 ip3] or clean format
-		ipsStr = strings.Trim(ipsStr, "[]")
-		ipsStr = strings.TrimSpace(ipsStr)
-
-		// Split by space and clean each IP
-		ips := strings.Fields(ipsStr)
-
-		for _, ip := range ips {
-			if ip == clientIP {
-				return true, true // Cache this result
-			}
+		// Use SISMEMBER to check if IP exists in the set
+		// Key pattern is expected to be org:123:ips for the set
+		if o.redisSIsMember(conn.fd, key, clientIP) {
+			return true, true // IP found in set, allow access
 		}
 	}
 
@@ -498,113 +484,76 @@ func (o *OrgIDAuth) queryNodeForKeys(nodeAddr, pattern string) []string {
 	return o.redisKeysSingleNode(fd, pattern)
 }
 
-// Redis HGET command with cluster support
-func (o *OrgIDAuth) redisHGet(fd int, key, field string) string {
+// Redis SISMEMBER command with cluster support
+func (o *OrgIDAuth) redisSIsMember(fd int, key, member string) bool {
 	if !o.clusterMode {
-		return o.redisHGetSingleNode(fd, key, field)
+		return o.redisSIsMemberSingleNode(fd, key, member)
 	}
-	return o.redisHGetCluster(fd, key, field)
+	return o.redisSIsMemberCluster(fd, key, member)
 }
 
-// Redis HGET for cluster mode - handles MOVED redirects
-func (o *OrgIDAuth) redisHGetCluster(fd int, key, field string) string {
+// Redis SISMEMBER for cluster mode - handles MOVED redirects
+func (o *OrgIDAuth) redisSIsMemberCluster(fd int, key, member string) bool {
 	// Try the connected node first
-	cmd := fmt.Sprintf("*3\r\n$4\r\nHGET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(field), field)
+	cmd := fmt.Sprintf("*3\r\n$9\r\nSISMEMBER\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+		len(key), key, len(member), member)
 	_, err := syscall.Write(fd, []byte(cmd))
 	if err != nil {
-		return ""
+		log.Printf("[ORGID-AUTH] Error writing SISMEMBER command: %v", err)
+		return false
 	}
 
-	buf := make([]byte, 4096)
-	n, err := syscall.Read(fd, buf)
+	// Read response
+	reader := bufio.NewReader(os.NewFile(uintptr(fd), "redis-conn"))
+	response, err := reader.ReadString('\n')
 	if err != nil {
-		return ""
+		log.Printf("[ORGID-AUTH] Error reading SISMEMBER response: %v", err)
+		return false
 	}
-
-	response := string(buf[:n])
 
 	// Check for MOVED redirect
 	if strings.HasPrefix(response, "-MOVED") {
-		// Parse MOVED response: -MOVED <slot> <ip:port>
+		// Extract new node address from MOVED response
 		parts := strings.Fields(response)
 		if len(parts) >= 3 {
-			targetNode := parts[2]
-			targetNode = strings.TrimSuffix(targetNode, "\r\n")
-
-			// Query the correct node
-			return o.queryNodeForHGet(targetNode, key, field)
+			nodeAddr := parts[2]
+			// Connect to the new node and retry
+			nodeFd, err := o.connectToNode(nodeAddr)
+			if err != nil {
+				log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
+				return false
+			}
+			defer syscall.Close(nodeFd)
+			return o.redisSIsMemberSingleNode(nodeFd, key, member)
 		}
-		return ""
 	}
 
-	// Parse normal response
-	return o.parseHGetResponse(response)
+	// Parse response (should be ":1" for member exists, ":0" for doesn't exist)
+	response = strings.TrimSpace(response)
+	return response == ":1"
 }
 
-// Query a specific node for HGET
-func (o *OrgIDAuth) queryNodeForHGet(nodeAddr, key, field string) string {
-	fd, err := o.connectToNode(nodeAddr)
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
-		return ""
-	}
-	defer syscall.Close(fd)
-
-	return o.redisHGetSingleNode(fd, key, field)
-}
-
-// Redis HGET for single node
-func (o *OrgIDAuth) redisHGetSingleNode(fd int, key, field string) string {
-	cmd := fmt.Sprintf("*3\r\n$4\r\nHGET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(field), field)
+// Redis SISMEMBER for single node
+func (o *OrgIDAuth) redisSIsMemberSingleNode(fd int, key, member string) bool {
+	cmd := fmt.Sprintf("*3\r\n$9\r\nSISMEMBER\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+		len(key), key, len(member), member)
 	_, err := syscall.Write(fd, []byte(cmd))
 	if err != nil {
-		return ""
+		log.Printf("[ORGID-AUTH] Error writing SISMEMBER command: %v", err)
+		return false
 	}
 
-	// Read response into buffer
-	buf := make([]byte, 4096)
-	n, err := syscall.Read(fd, buf)
+	// Read response
+	reader := bufio.NewReader(os.NewFile(uintptr(fd), "redis-conn"))
+	response, err := reader.ReadString('\n')
 	if err != nil {
-		return ""
+		log.Printf("[ORGID-AUTH] Error reading SISMEMBER response: %v", err)
+		return false
 	}
 
-	return o.parseHGetResponse(string(buf[:n]))
-}
-
-// Parse HGET response (bulk string format)
-func (o *OrgIDAuth) parseHGetResponse(response string) string {
-	reader := bufio.NewReader(bytes.NewReader([]byte(response)))
-	firstLine, err := reader.ReadString('\n')
-	if err != nil {
-		return ""
-	}
-
-	// Parse bulk string response
-	firstLine = strings.TrimSpace(firstLine)
-	if strings.HasPrefix(firstLine, "$-1") {
-		return "" // nil response
-	}
-	if !strings.HasPrefix(firstLine, "$") {
-		return ""
-	}
-
-	// Parse length
-	lengthStr := firstLine[1:]
-	length, err := strconv.Atoi(lengthStr)
-	if err != nil || length < 0 {
-		return ""
-	}
-
-	// Read exact number of bytes + \r\n
-	valueBytes := make([]byte, length+2)
-	_, err = reader.Read(valueBytes)
-	if err != nil {
-		return ""
-	}
-
-	// Extract value (without \r\n)
-	value := string(valueBytes[:length])
-	return value
+	// Parse response (should be ":1" for member exists, ":0" for doesn't exist)
+	response = strings.TrimSpace(response)
+	return response == ":1"
 }
 
 // getClientIP implements Traefik's IP detection logic
@@ -619,12 +568,12 @@ func getClientIP(req *http.Request) string {
 			}
 		}
 	}
-	
+
 	// Try X-Real-IP header
 	if xri := req.Header.Get("X-Real-IP"); xri != "" && isValidIP(xri) {
 		return xri
 	}
-	
+
 	// Fall back to RemoteAddr
 	if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 		return host

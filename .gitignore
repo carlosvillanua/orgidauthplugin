@@ -1,0 +1,6 @@
+# Backups
+*.backup
+**/*.backup
+.DS_Store
+.vscode/
+*.log
