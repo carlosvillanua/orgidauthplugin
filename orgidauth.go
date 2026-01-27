@@ -17,6 +17,7 @@ import (
 
 type Config struct {
 	RedisAddr       string `json:"redisAddr,omitempty"`
+	RedisUsername   string `json:"redisUsername,omitempty"`
 	RedisPassword   string `json:"redisPassword,omitempty"`
 	OrgHeader       string `json:"orgHeader,omitempty"`
 	PoolSize        int    `json:"poolSize,omitempty"`
@@ -30,6 +31,7 @@ type Config struct {
 func CreateConfig() *Config {
 	return &Config{
 		RedisAddr:       "valkey-redis-master.traefik.svc.cluster.local:6379",
+		RedisUsername:   "",
 		RedisPassword:   "traefik",
 		OrgHeader:       "X-Org",
 		PoolSize:        10,
@@ -53,6 +55,7 @@ type ConnectionPool struct {
 	connections     []*Connection
 	mutex           sync.Mutex
 	redisAddr       string
+	redisUsername   string
 	redisPassword   string
 	poolSize        int
 	maxConnIdleTime time.Duration
@@ -106,6 +109,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	pool := &ConnectionPool{
 		connections:     make([]*Connection, 0, config.PoolSize),
 		redisAddr:       config.RedisAddr,
+		redisUsername:   config.RedisUsername,
 		redisPassword:   config.RedisPassword,
 		poolSize:        config.PoolSize,
 		maxConnIdleTime: maxConnIdleTime,
@@ -483,7 +487,16 @@ func (o *OrgIDAuth) connectToNode(nodeAddr string) (int, error) {
 
 	// Authenticate if needed
 	if o.pool.redisPassword != "" {
-		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
+		var authCmd string
+		if o.pool.redisUsername != "" {
+			// AUTH username password (Redis 6+)
+			authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+				len(o.pool.redisUsername), o.pool.redisUsername,
+				len(o.pool.redisPassword), o.pool.redisPassword)
+		} else {
+			// AUTH password (Redis < 6)
+			authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
+		}
 		if _, err = syscall.Write(fd, []byte(authCmd)); err != nil {
 			syscall.Close(fd)
 			return -1, err
@@ -1157,7 +1170,16 @@ func (p *ConnectionPool) createConnection() (*Connection, error) {
 
 	// Authenticate if password is set
 	if p.redisPassword != "" {
-		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(p.redisPassword), p.redisPassword)
+		var authCmd string
+		if p.redisUsername != "" {
+			// AUTH username password (Redis 6+)
+			authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+				len(p.redisUsername), p.redisUsername,
+				len(p.redisPassword), p.redisPassword)
+		} else {
+			// AUTH password (Redis < 6)
+			authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(p.redisPassword), p.redisPassword)
+		}
 		_, err = syscall.Write(fd, []byte(authCmd))
 		if err != nil {
 			syscall.Close(fd)

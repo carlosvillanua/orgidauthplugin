@@ -10,6 +10,7 @@ useUnsafe: true
 
 testData:
   redisAddr: "valkey-redis-master.traefik.svc.cluster.local:6379"
+  redisUsername: "default"
   redisPassword: "traefik"
   orgHeader: "X-Org"
   poolSize: 10

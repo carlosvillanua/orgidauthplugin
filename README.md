@@ -58,6 +58,7 @@ spec:
   plugin:
     orgidauthplugin:
       redisAddr: "redis-master.default.svc.cluster.local:6379"
+      redisUsername: "default"
       redisPassword: "your-password"
       orgHeader: "X-Org"
       poolSize: 10
@@ -92,6 +93,7 @@ spec:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `redisAddr` | string | `valkey-redis-master.traefik.svc.cluster.local:6379` | Redis server address |
+| `redisUsername` | string | `""` | Redis username (Redis 6+ ACL) |
 | `redisPassword` | string | `traefik` | Redis password |
 | `orgHeader` | string | `X-Org` | Header containing org IDs (set by JWT middleware) |
 | `poolSize` | int | `10` | Max Redis connections |
@@ -110,6 +112,8 @@ spec:
   plugin:
     orgidauthplugin:
       redisAddr: "redis-cluster.default.svc.cluster.local:6379"
+      redisUsername: "default"
+      redisPassword: "your-password"
       clusterMode: true
       poolSize: 100      # Higher for cluster
       cacheTTL: "1s"     # Lower for faster updates
@@ -145,31 +149,31 @@ SADD "uuid:org-456:allowed" "172.16.50.100" "10.0.0.0/8" "192.168.1.0/24"
 **Managing Allowlists:**
 ```bash
 # Add individual IPs to allowlist
-kubectl exec -n traefik redis-0 -- redis-cli -a password \
+kubectl exec -n traefik redis-0 -- redis-cli --user default -a password \
   SADD "uuid:org-123:allowed" "10.0.1.5" "192.168.1.100"
 
 # Add CIDR blocks to allowlist
-kubectl exec -n traefik redis-0 -- redis-cli -a password \
+kubectl exec -n traefik redis-0 -- redis-cli --user default -a password \
   SADD "uuid:org-123:allowed" "10.42.0.0/16" "192.168.0.0/24"
 
 # Add mixed (IPs and CIDRs)
-kubectl exec -n traefik redis-0 -- redis-cli -a password \
+kubectl exec -n traefik redis-0 -- redis-cli --user default -a password \
   SADD "uuid:org-123:allowed" "172.16.50.100" "10.0.0.0/8"
 
 # View all allowed IPs/CIDRs
-kubectl exec -n traefik redis-0 -- redis-cli -a password \
+kubectl exec -n traefik redis-0 -- redis-cli --user default -a password \
   SMEMBERS "uuid:org-123:allowed"
 
 # Check if specific IP is allowed (exact match only)
-kubectl exec -n traefik redis-0 -- redis-cli -a password \
+kubectl exec -n traefik redis-0 -- redis-cli --user default -a password \
   SISMEMBER "uuid:org-123:allowed" "10.0.1.5"
 
 # Remove IP or CIDR from allowlist
-kubectl exec -n traefik redis-0 -- redis-cli -a password \
+kubectl exec -n traefik redis-0 -- redis-cli --user default -a password \
   SREM "uuid:org-123:allowed" "10.0.1.5"
 
 # Remove entire allowlist
-kubectl exec -n traefik redis-0 -- redis-cli -a password \
+kubectl exec -n traefik redis-0 -- redis-cli --user default -a password \
   DEL "uuid:org-123:allowed"
 ```
 
@@ -194,6 +198,11 @@ kubectl exec -n traefik redis-0 -- redis-cli -a password \
 - WARNING for Redis failures (fail-open)
 
 ## Version History
+
+### v0.1.10 (2026-01-27)
+- Added Redis username (ACL) support for Redis 6+
+- Updated AUTH command to support both username+password and password-only modes
+- Backwards compatible with Redis versions < 6
 
 ### v0.1.9 (2026-01-26)
 - Added CIDR block support for IP allowlists
