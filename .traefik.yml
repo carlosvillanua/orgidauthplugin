@@ -18,3 +18,5 @@ testData:
   poolWaitTimeout: "2s"
   cacheTTL: "30s"
   cacheMaxSize: 1000
+  tlsEnabled: false
+  tlsInsecureSkipVerify: false

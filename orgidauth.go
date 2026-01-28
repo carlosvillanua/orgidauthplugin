@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net"
@@ -16,38 +18,46 @@ import (
 )
 
 type Config struct {
-	RedisAddr       string `json:"redisAddr,omitempty"`
-	RedisUsername   string `json:"redisUsername,omitempty"`
-	RedisPassword   string `json:"redisPassword,omitempty"`
-	OrgHeader       string `json:"orgHeader,omitempty"`
-	PoolSize        int    `json:"poolSize,omitempty"`
-	MaxConnIdleTime string `json:"maxConnIdleTime,omitempty"`
-	PoolWaitTimeout string `json:"poolWaitTimeout,omitempty"`
-	CacheTTL        string `json:"cacheTTL,omitempty"`
-	CacheMaxSize    int    `json:"cacheMaxSize,omitempty"`
-	ClusterMode     bool   `json:"clusterMode,omitempty"`
+	RedisAddr           string `json:"redisAddr,omitempty"`
+	RedisUsername       string `json:"redisUsername,omitempty"`
+	RedisPassword       string `json:"redisPassword,omitempty"`
+	OrgHeader           string `json:"orgHeader,omitempty"`
+	PoolSize            int    `json:"poolSize,omitempty"`
+	MaxConnIdleTime     string `json:"maxConnIdleTime,omitempty"`
+	PoolWaitTimeout     string `json:"poolWaitTimeout,omitempty"`
+	CacheTTL            string `json:"cacheTTL,omitempty"`
+	CacheMaxSize        int    `json:"cacheMaxSize,omitempty"`
+	ClusterMode         bool   `json:"clusterMode,omitempty"`
+	TLSEnabled          bool   `json:"tlsEnabled,omitempty"`
+	TLSCABundle         string `json:"tlsCABundle,omitempty"`
+	TLSInsecureSkipVerify bool `json:"tlsInsecureSkipVerify,omitempty"`
 }
 
 func CreateConfig() *Config {
 	return &Config{
-		RedisAddr:       "valkey-redis-master.traefik.svc.cluster.local:6379",
-		RedisUsername:   "",
-		RedisPassword:   "traefik",
-		OrgHeader:       "X-Org",
-		PoolSize:        10,
-		MaxConnIdleTime: "5m",
-		PoolWaitTimeout: "2s",
-		CacheTTL:        "30s",
-		CacheMaxSize:    1000,
-		ClusterMode:     false,
+		RedisAddr:             "valkey-redis-master.traefik.svc.cluster.local:6379",
+		RedisUsername:         "",
+		RedisPassword:         "traefik",
+		OrgHeader:             "X-Org",
+		PoolSize:              10,
+		MaxConnIdleTime:       "5m",
+		PoolWaitTimeout:       "2s",
+		CacheTTL:              "30s",
+		CacheMaxSize:          1000,
+		ClusterMode:           false,
+		TLSEnabled:            false,
+		TLSCABundle:           "",
+		TLSInsecureSkipVerify: false,
 	}
 }
 
 // Connection represents a Redis connection
 type Connection struct {
-	fd       int
+	fd       int       // Used for non-TLS connections
+	conn     net.Conn  // Used for TLS connections
 	lastUsed time.Time
 	inUse    bool
+	isTLS    bool      // Track connection type
 }
 
 // ConnectionPool manages Redis connections
@@ -60,6 +70,8 @@ type ConnectionPool struct {
 	poolSize        int
 	maxConnIdleTime time.Duration
 	poolWaitTimeout time.Duration
+	tlsConfig       *tls.Config
+	tlsEnabled      bool
 }
 
 // CacheEntry stores cached IP validation results
@@ -106,6 +118,23 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		cacheTTL = 30 * time.Second
 	}
 
+	// Initialize TLS configuration if enabled
+	var tlsConfig *tls.Config
+	if config.TLSEnabled {
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: config.TLSInsecureSkipVerify,
+		}
+
+		// Load CA bundle if provided
+		if config.TLSCABundle != "" {
+			caCertPool := x509.NewCertPool()
+			if ok := caCertPool.AppendCertsFromPEM([]byte(config.TLSCABundle)); !ok {
+				return nil, fmt.Errorf("failed to parse CA bundle")
+			}
+			tlsConfig.RootCAs = caCertPool
+		}
+	}
+
 	pool := &ConnectionPool{
 		connections:     make([]*Connection, 0, config.PoolSize),
 		redisAddr:       config.RedisAddr,
@@ -114,6 +143,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		poolSize:        config.PoolSize,
 		maxConnIdleTime: maxConnIdleTime,
 		poolWaitTimeout: poolWaitTimeout,
+		tlsConfig:       tlsConfig,
+		tlsEnabled:      config.TLSEnabled,
 	}
 
 	cache := &IPCache{
@@ -220,7 +251,7 @@ func (o *OrgIDAuth) isIPAllowedForOrg(orgID, clientIP string) (bool, bool) {
 	key := fmt.Sprintf("uuid:%s:allowed", orgID)
 
 	// Check if the key exists first
-	exists := o.redisExists(conn.fd, key)
+	exists := o.redisExists(conn, key)
 
 	// Check if Redis command failed (connection issue)
 	if exists < 0 {
@@ -235,12 +266,12 @@ func (o *OrgIDAuth) isIPAllowedForOrg(orgID, clientIP string) (bool, bool) {
 	}
 
 	// First try exact IP match (fast path)
-	if o.redisSIsMember(conn.fd, key, clientIP) {
+	if o.redisSIsMember(conn, key, clientIP) {
 		return true, true // IP found in set, allow access
 	}
 
 	// If no exact match, check CIDR blocks
-	members := o.redisSMembers(conn.fd, key)
+	members := o.redisSMembers(conn, key)
 	if members == nil {
 		// Error fetching members
 		connFailed = true
@@ -274,27 +305,27 @@ func (o *OrgIDAuth) isIPAllowedForOrg(orgID, clientIP string) (bool, bool) {
 }
 
 // Redis KEYS command with cluster support
-func (o *OrgIDAuth) redisKeys(fd int, pattern string) []string {
+func (o *OrgIDAuth) redisKeys(conn *Connection, pattern string) []string {
 	if !o.clusterMode {
 		// Single node mode - use current implementation
-		return o.redisKeysSingleNode(fd, pattern)
+		return o.redisKeysSingleNode(conn, pattern)
 	}
 
 	// Cluster mode - query all nodes
-	return o.redisKeysCluster(fd, pattern)
+	return o.redisKeysCluster(conn, pattern)
 }
 
 // Redis KEYS command for single node
-func (o *OrgIDAuth) redisKeysSingleNode(fd int, pattern string) []string {
+func (o *OrgIDAuth) redisKeysSingleNode(conn *Connection, pattern string) []string {
 	cmd := fmt.Sprintf("*2\r\n$4\r\nKEYS\r\n$%d\r\n%s\r\n", len(pattern), pattern)
-	_, err := syscall.Write(fd, []byte(cmd))
+	_, err := connWrite(conn, []byte(cmd))
 	if err != nil {
 		return nil
 	}
 
 	// Read response into buffer
 	buf := make([]byte, 8192)
-	n, err := syscall.Read(fd, buf)
+	n, err := connRead(conn, buf)
 	if err != nil {
 		return nil
 	}
@@ -355,12 +386,12 @@ func (o *OrgIDAuth) redisKeysSingleNode(fd int, pattern string) []string {
 }
 
 // Redis KEYS command for cluster mode - queries all nodes
-func (o *OrgIDAuth) redisKeysCluster(fd int, pattern string) []string {
+func (o *OrgIDAuth) redisKeysCluster(conn *Connection, pattern string) []string {
 	// Get all cluster nodes
-	nodes := o.getClusterNodes(fd)
+	nodes := o.getClusterNodes(conn)
 	if len(nodes) == 0 {
 		log.Printf("[ORGID-AUTH] WARNING: Could not get cluster nodes, falling back to single node")
-		return o.redisKeysSingleNode(fd, pattern)
+		return o.redisKeysSingleNode(conn, pattern)
 	}
 
 	log.Printf("[ORGID-AUTH] Cluster mode: querying %d nodes for pattern %s", len(nodes), pattern)
@@ -385,16 +416,16 @@ func (o *OrgIDAuth) redisKeysCluster(fd int, pattern string) []string {
 }
 
 // Get all cluster node addresses
-func (o *OrgIDAuth) getClusterNodes(fd int) []string {
+func (o *OrgIDAuth) getClusterNodes(conn *Connection) []string {
 	cmd := "*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n"
-	_, err := syscall.Write(fd, []byte(cmd))
+	_, err := connWrite(conn, []byte(cmd))
 	if err != nil {
 		return nil
 	}
 
 	// Read response
 	buf := make([]byte, 16384)
-	n, err := syscall.Read(fd, buf)
+	n, err := connRead(conn, buf)
 	if err != nil {
 		return nil
 	}
@@ -445,20 +476,71 @@ func (o *OrgIDAuth) getClusterNodes(fd int) []string {
 }
 
 // connectToNode creates an authenticated connection to a specific cluster node
-func (o *OrgIDAuth) connectToNode(nodeAddr string) (int, error) {
+func (o *OrgIDAuth) connectToNode(nodeAddr string) (*Connection, error) {
+	// If TLS is enabled, use TLS connection
+	if o.pool.tlsEnabled {
+		dialer := &net.Dialer{
+			Timeout: 5 * time.Second,
+		}
+
+		conn, err := tls.DialWithDialer(dialer, "tcp", nodeAddr, o.pool.tlsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("TLS connection failed: %v", err)
+		}
+
+		// Perform TLS handshake
+		if err := conn.Handshake(); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("TLS handshake failed: %v", err)
+		}
+
+		// Authenticate if needed
+		if o.pool.redisPassword != "" {
+			var authCmd string
+			if o.pool.redisUsername != "" {
+				// AUTH username password (Redis 6+)
+				authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+					len(o.pool.redisUsername), o.pool.redisUsername,
+					len(o.pool.redisPassword), o.pool.redisPassword)
+			} else {
+				// AUTH password (Redis < 6)
+				authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
+			}
+			if _, err = conn.Write([]byte(authCmd)); err != nil {
+				conn.Close()
+				return nil, err
+			}
+
+			buf := make([]byte, 1024)
+			n, err := conn.Read(buf)
+			if err != nil || !strings.Contains(string(buf[:n]), "+OK") {
+				conn.Close()
+				return nil, fmt.Errorf("auth failed")
+			}
+		}
+
+		return &Connection{
+			conn:     conn,
+			lastUsed: time.Now(),
+			inUse:    false,
+			isTLS:    true,
+		}, nil
+	}
+
+	// Plain TCP connection
 	host, portStr, err := net.SplitHostPort(nodeAddr)
 	if err != nil {
-		return -1, fmt.Errorf("parse address: %v", err)
+		return nil, fmt.Errorf("parse address: %v", err)
 	}
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return -1, err
+		return nil, err
 	}
 
 	ips, err := net.LookupIP(host)
 	if err != nil || len(ips) == 0 {
-		return -1, fmt.Errorf("resolve %s: %v", host, err)
+		return nil, fmt.Errorf("resolve %s: %v", host, err)
 	}
 
 	var ip net.IP
@@ -474,7 +556,7 @@ func (o *OrgIDAuth) connectToNode(nodeAddr string) (int, error) {
 
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
 	if err != nil {
-		return -1, err
+		return nil, err
 	}
 
 	sa := &syscall.SockaddrInet4{Port: port}
@@ -482,7 +564,7 @@ func (o *OrgIDAuth) connectToNode(nodeAddr string) (int, error) {
 
 	if err := syscall.Connect(fd, sa); err != nil {
 		syscall.Close(fd)
-		return -1, fmt.Errorf("connect: %v", err)
+		return nil, fmt.Errorf("connect: %v", err)
 	}
 
 	// Authenticate if needed
@@ -499,54 +581,59 @@ func (o *OrgIDAuth) connectToNode(nodeAddr string) (int, error) {
 		}
 		if _, err = syscall.Write(fd, []byte(authCmd)); err != nil {
 			syscall.Close(fd)
-			return -1, err
+			return nil, err
 		}
 
 		buf := make([]byte, 1024)
 		n, err := syscall.Read(fd, buf)
 		if err != nil || !strings.Contains(string(buf[:n]), "+OK") {
 			syscall.Close(fd)
-			return -1, fmt.Errorf("auth failed")
+			return nil, fmt.Errorf("auth failed")
 		}
 	}
 
-	return fd, nil
+	return &Connection{
+		fd:       fd,
+		lastUsed: time.Now(),
+		inUse:    false,
+		isTLS:    false,
+	}, nil
 }
 
 // Query a specific node for keys matching pattern
 func (o *OrgIDAuth) queryNodeForKeys(nodeAddr, pattern string) []string {
-	fd, err := o.connectToNode(nodeAddr)
+	nodeConn, err := o.connectToNode(nodeAddr)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
 		return nil
 	}
-	defer syscall.Close(fd)
+	defer connClose(nodeConn)
 
-	return o.redisKeysSingleNode(fd, pattern)
+	return o.redisKeysSingleNode(nodeConn, pattern)
 }
 
 // Redis SISMEMBER command with cluster support
-func (o *OrgIDAuth) redisSIsMember(fd int, key, member string) bool {
+func (o *OrgIDAuth) redisSIsMember(conn *Connection, key, member string) bool {
 	if !o.clusterMode {
-		return o.redisSIsMemberSingleNode(fd, key, member)
+		return o.redisSIsMemberSingleNode(conn, key, member)
 	}
-	return o.redisSIsMemberCluster(fd, key, member)
+	return o.redisSIsMemberCluster(conn, key, member)
 }
 
 // Redis SISMEMBER for cluster mode - handles MOVED redirects
-func (o *OrgIDAuth) redisSIsMemberCluster(fd int, key, member string) bool {
+func (o *OrgIDAuth) redisSIsMemberCluster(conn *Connection, key, member string) bool {
 	// Try the connected node first
 	cmd := fmt.Sprintf("*3\r\n$9\r\nSISMEMBER\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
 		len(key), key, len(member), member)
-	_, err := syscall.Write(fd, []byte(cmd))
+	_, err := connWrite(conn, []byte(cmd))
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error writing SISMEMBER command: %v", err)
 		return false
 	}
 
-	// Read response using syscall.Read to avoid FD ownership issues
+	// Read response
 	buf := make([]byte, 1024)
-	n, err := syscall.Read(fd, buf)
+	n, err := connRead(conn, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading SISMEMBER response: %v", err)
 		return false
@@ -566,13 +653,13 @@ func (o *OrgIDAuth) redisSIsMemberCluster(fd int, key, member string) bool {
 		if len(parts) >= 3 {
 			nodeAddr := parts[2]
 			// Connect to the new node and retry
-			nodeFd, err := o.connectToNode(nodeAddr)
+			nodeConn, err := o.connectToNode(nodeAddr)
 			if err != nil {
 				log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
 				return false
 			}
-			defer syscall.Close(nodeFd)
-			return o.redisSIsMemberSingleNode(nodeFd, key, member)
+			defer connClose(nodeConn)
+			return o.redisSIsMemberSingleNode(nodeConn, key, member)
 		}
 	}
 
@@ -582,18 +669,18 @@ func (o *OrgIDAuth) redisSIsMemberCluster(fd int, key, member string) bool {
 }
 
 // Redis SISMEMBER for single node
-func (o *OrgIDAuth) redisSIsMemberSingleNode(fd int, key, member string) bool {
+func (o *OrgIDAuth) redisSIsMemberSingleNode(conn *Connection, key, member string) bool {
 	cmd := fmt.Sprintf("*3\r\n$9\r\nSISMEMBER\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
 		len(key), key, len(member), member)
-	_, err := syscall.Write(fd, []byte(cmd))
+	_, err := connWrite(conn, []byte(cmd))
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error writing SISMEMBER command: %v", err)
 		return false
 	}
 
-	// Read response using syscall.Read to avoid FD ownership issues
+	// Read response
 	buf := make([]byte, 1024)
-	n, err := syscall.Read(fd, buf)
+	n, err := connRead(conn, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading SISMEMBER response: %v", err)
 		return false
@@ -612,25 +699,25 @@ func (o *OrgIDAuth) redisSIsMemberSingleNode(fd int, key, member string) bool {
 }
 
 // Redis SMEMBERS command with cluster support
-func (o *OrgIDAuth) redisSMembers(fd int, key string) []string {
+func (o *OrgIDAuth) redisSMembers(conn *Connection, key string) []string {
 	if !o.clusterMode {
-		return o.redisSMembersSingleNode(fd, key)
+		return o.redisSMembersSingleNode(conn, key)
 	}
-	return o.redisSMembersCluster(fd, key)
+	return o.redisSMembersCluster(conn, key)
 }
 
 // Redis SMEMBERS for single node
-func (o *OrgIDAuth) redisSMembersSingleNode(fd int, key string) []string {
+func (o *OrgIDAuth) redisSMembersSingleNode(conn *Connection, key string) []string {
 	cmd := fmt.Sprintf("*2\r\n$8\r\nSMEMBERS\r\n$%d\r\n%s\r\n", len(key), key)
-	_, err := syscall.Write(fd, []byte(cmd))
+	_, err := connWrite(conn, []byte(cmd))
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error writing SMEMBERS command: %v", err)
 		return nil
 	}
 
-	// Read response using syscall.Read to avoid FD ownership issues
+	// Read response
 	buf := make([]byte, 8192) // Larger buffer for multiple members
-	n, err := syscall.Read(fd, buf)
+	n, err := connRead(conn, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading SMEMBERS response: %v", err)
 		return nil
@@ -693,17 +780,17 @@ func (o *OrgIDAuth) redisSMembersSingleNode(fd int, key string) []string {
 }
 
 // Redis SMEMBERS for cluster mode - handles MOVED redirects
-func (o *OrgIDAuth) redisSMembersCluster(fd int, key string) []string {
+func (o *OrgIDAuth) redisSMembersCluster(conn *Connection, key string) []string {
 	cmd := fmt.Sprintf("*2\r\n$8\r\nSMEMBERS\r\n$%d\r\n%s\r\n", len(key), key)
-	_, err := syscall.Write(fd, []byte(cmd))
+	_, err := connWrite(conn, []byte(cmd))
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error writing SMEMBERS command: %v", err)
 		return nil
 	}
 
-	// Read response using syscall.Read to avoid FD ownership issues
+	// Read response
 	buf := make([]byte, 8192)
-	n, err := syscall.Read(fd, buf)
+	n, err := connRead(conn, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading SMEMBERS response: %v", err)
 		return nil
@@ -723,13 +810,13 @@ func (o *OrgIDAuth) redisSMembersCluster(fd int, key string) []string {
 		if len(parts) >= 3 {
 			nodeAddr := parts[2]
 			// Connect to the new node and retry
-			nodeFd, err := o.connectToNode(nodeAddr)
+			nodeConn, err := o.connectToNode(nodeAddr)
 			if err != nil {
 				log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
 				return nil
 			}
-			defer syscall.Close(nodeFd)
-			return o.redisSMembersSingleNode(nodeFd, key)
+			defer connClose(nodeConn)
+			return o.redisSMembersSingleNode(nodeConn, key)
 		}
 	}
 
@@ -784,25 +871,25 @@ func (o *OrgIDAuth) redisSMembersCluster(fd int, key string) []string {
 
 // Redis EXISTS command with cluster support
 // Returns: 1 if key exists, 0 if not exists, -1 on error
-func (o *OrgIDAuth) redisExists(fd int, key string) int {
+func (o *OrgIDAuth) redisExists(conn *Connection, key string) int {
 	if !o.clusterMode {
-		return o.redisExistsSingleNode(fd, key)
+		return o.redisExistsSingleNode(conn, key)
 	}
-	return o.redisExistsCluster(fd, key)
+	return o.redisExistsCluster(conn, key)
 }
 
 // Redis EXISTS for single node
-func (o *OrgIDAuth) redisExistsSingleNode(fd int, key string) int {
+func (o *OrgIDAuth) redisExistsSingleNode(conn *Connection, key string) int {
 	cmd := fmt.Sprintf("*2\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key)
-	_, err := syscall.Write(fd, []byte(cmd))
+	_, err := connWrite(conn, []byte(cmd))
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error writing EXISTS command: %v", err)
 		return -1
 	}
 
-	// Read response using syscall.Read to avoid FD ownership issues
+	// Read response
 	buf := make([]byte, 1024)
-	n, err := syscall.Read(fd, buf)
+	n, err := connRead(conn, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading EXISTS response: %v", err)
 		return -1
@@ -827,17 +914,17 @@ func (o *OrgIDAuth) redisExistsSingleNode(fd int, key string) int {
 }
 
 // Redis EXISTS for cluster mode - handles MOVED redirects
-func (o *OrgIDAuth) redisExistsCluster(fd int, key string) int {
+func (o *OrgIDAuth) redisExistsCluster(conn *Connection, key string) int {
 	cmd := fmt.Sprintf("*2\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key)
-	_, err := syscall.Write(fd, []byte(cmd))
+	_, err := connWrite(conn, []byte(cmd))
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error writing EXISTS command: %v", err)
 		return -1
 	}
 
-	// Read response using syscall.Read to avoid FD ownership issues
+	// Read response
 	buf := make([]byte, 1024)
-	n, err := syscall.Read(fd, buf)
+	n, err := connRead(conn, buf)
 	if err != nil {
 		log.Printf("[ORGID-AUTH] Error reading EXISTS response: %v", err)
 		return -1
@@ -857,13 +944,13 @@ func (o *OrgIDAuth) redisExistsCluster(fd int, key string) int {
 		if len(parts) >= 3 {
 			nodeAddr := parts[2]
 			// Connect to the new node and retry
-			nodeFd, err := o.connectToNode(nodeAddr)
+			nodeConn, err := o.connectToNode(nodeAddr)
 			if err != nil {
 				log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
 				return -1
 			}
-			defer syscall.Close(nodeFd)
-			return o.redisExistsSingleNode(nodeFd, key)
+			defer connClose(nodeConn)
+			return o.redisExistsSingleNode(nodeConn, key)
 		}
 	}
 
@@ -987,8 +1074,12 @@ func (p *ConnectionPool) getConnection() (*Connection, error) {
 			if !conn.inUse {
 				// Check if connection is stale
 				if time.Since(conn.lastUsed) > p.maxConnIdleTime {
-					log.Printf("[ORGID-AUTH] Removing stale connection fd=%d (idle for %v)", conn.fd, time.Since(conn.lastUsed))
-					syscall.Close(conn.fd)
+					connType := "plain"
+					if conn.isTLS {
+						connType = "TLS"
+					}
+					log.Printf("[ORGID-AUTH] Removing stale %s connection (idle for %v)", connType, time.Since(conn.lastUsed))
+					connClose(conn)
 					// Remove stale connection
 					p.connections = append(p.connections[:i], p.connections[i+1:]...)
 					continue
@@ -1040,10 +1131,13 @@ func (p *ConnectionPool) removeConnection(conn *Connection) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	// Close the socket
-	if conn.fd > 0 {
-		syscall.Close(conn.fd)
-		log.Printf("[ORGID-AUTH] Closed failed connection fd=%d", conn.fd)
+	// Close the connection
+	if err := connClose(conn); err == nil {
+		if conn.isTLS {
+			log.Printf("[ORGID-AUTH] Closed failed TLS connection")
+		} else {
+			log.Printf("[ORGID-AUTH] Closed failed connection fd=%d", conn.fd)
+		}
 	}
 
 	// Remove from pool
@@ -1061,9 +1155,12 @@ func (p *ConnectionPool) Close() {
 	defer p.mutex.Unlock()
 
 	for _, conn := range p.connections {
-		if conn.fd > 0 {
-			syscall.Close(conn.fd)
-			log.Printf("[ORGID-AUTH] Closed connection fd=%d during shutdown", conn.fd)
+		if err := connClose(conn); err == nil {
+			connType := "plain"
+			if conn.isTLS {
+				connType = "TLS"
+			}
+			log.Printf("[ORGID-AUTH] Closed %s connection during shutdown", connType)
 		}
 	}
 	p.connections = nil
@@ -1071,6 +1168,73 @@ func (p *ConnectionPool) Close() {
 
 // createConnection creates a new Redis connection
 func (p *ConnectionPool) createConnection() (*Connection, error) {
+	// If TLS is enabled, use TLS connection
+	if p.tlsEnabled {
+		return p.createTLSConnection()
+	}
+	return p.createPlainConnection()
+}
+
+// createTLSConnection creates a new TLS Redis connection
+func (p *ConnectionPool) createTLSConnection() (*Connection, error) {
+	// Use tls.Dial to establish TLS connection
+	dialer := &net.Dialer{
+		Timeout: 5 * time.Second,
+	}
+
+	conn, err := tls.DialWithDialer(dialer, "tcp", p.redisAddr, p.tlsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("TLS connection failed: %v", err)
+	}
+
+	// Perform TLS handshake
+	if err := conn.Handshake(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("TLS handshake failed: %v", err)
+	}
+
+	// Authenticate if password is set
+	if p.redisPassword != "" {
+		var authCmd string
+		if p.redisUsername != "" {
+			// AUTH username password (Redis 6+)
+			authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+				len(p.redisUsername), p.redisUsername,
+				len(p.redisPassword), p.redisPassword)
+		} else {
+			// AUTH password (Redis < 6)
+			authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(p.redisPassword), p.redisPassword)
+		}
+		_, err = conn.Write([]byte(authCmd))
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to send auth command: %v", err)
+		}
+
+		// Read auth response
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to read auth response: %v", err)
+		}
+
+		if !strings.Contains(string(buf[:n]), "+OK") {
+			conn.Close()
+			return nil, fmt.Errorf("authentication failed")
+		}
+	}
+
+	return &Connection{
+		conn:     conn,
+		lastUsed: time.Now(),
+		inUse:    false,
+		isTLS:    true,
+	}, nil
+}
+
+// createPlainConnection creates a new plain (non-TLS) Redis connection
+func (p *ConnectionPool) createPlainConnection() (*Connection, error) {
 	// Parse host and port
 	host, portStr, err := net.SplitHostPort(p.redisAddr)
 	if err != nil {
@@ -1204,5 +1368,36 @@ func (p *ConnectionPool) createConnection() (*Connection, error) {
 		fd:       fd,
 		lastUsed: time.Now(),
 		inUse:    false,
+		isTLS:    false,
 	}, nil
+}
+
+// connRead reads from a connection (TLS or non-TLS)
+func connRead(conn *Connection, buf []byte) (int, error) {
+	if conn.isTLS {
+		return conn.conn.Read(buf)
+	}
+	return syscall.Read(conn.fd, buf)
+}
+
+// connWrite writes to a connection (TLS or non-TLS)
+func connWrite(conn *Connection, data []byte) (int, error) {
+	if conn.isTLS {
+		return conn.conn.Write(data)
+	}
+	return syscall.Write(conn.fd, data)
+}
+
+// connClose closes a connection (TLS or non-TLS)
+func connClose(conn *Connection) error {
+	if conn.isTLS {
+		if conn.conn != nil {
+			return conn.conn.Close()
+		}
+		return nil
+	}
+	if conn.fd > 0 {
+		return syscall.Close(conn.fd)
+	}
+	return nil
 }

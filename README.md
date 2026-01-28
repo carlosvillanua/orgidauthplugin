@@ -102,6 +102,9 @@ spec:
 | `cacheTTL` | duration | `30s` | Cache entry TTL |
 | `cacheMaxSize` | int | `1000` | Max cached entries |
 | `clusterMode` | bool | `false` | Enable Redis Cluster support |
+| `tlsEnabled` | bool | `false` | Enable TLS/SSL for Redis connections |
+| `tlsCABundle` | string | `""` | PEM-encoded CA certificate bundle for TLS verification |
+| `tlsInsecureSkipVerify` | bool | `false` | Skip TLS certificate verification (insecure, for testing only) |
 
 ## Redis Cluster
 
@@ -125,6 +128,51 @@ spec:
 - Ensures consistent key lookup across cluster shards
 
 **⚠️ Important:** Without `clusterMode: true`, `MOVED` redirects are not handled, which may cause errors when keys are on different nodes.
+
+## TLS/SSL Support
+
+The plugin supports encrypted TLS connections to Redis/Valkey:
+
+```yaml
+spec:
+  plugin:
+    orgidauthplugin:
+      redisAddr: "redis-cluster.traefik.svc.cluster.local:6380"
+      redisUsername: "admin"
+      redisPassword: "traefik"
+      clusterMode: true
+      tlsEnabled: true
+      tlsInsecureSkipVerify: true  # For testing with self-signed certs
+```
+
+**With CA Certificate Verification:**
+```yaml
+spec:
+  plugin:
+    orgidauthplugin:
+      redisAddr: "redis-cluster.traefik.svc.cluster.local:6380"
+      redisUsername: "admin"
+      redisPassword: "traefik"
+      clusterMode: true
+      tlsEnabled: true
+      tlsCABundle: |
+        -----BEGIN CERTIFICATE-----
+        [Your CA certificate content here]
+        -----END CERTIFICATE-----
+```
+
+**How it works:**
+- When `tlsEnabled: true`, the plugin establishes TLS connections using Go's `crypto/tls` package
+- `tlsInsecureSkipVerify: true` disables certificate verification (useful for testing)
+- `tlsCABundle` provides a custom CA certificate for verification
+- Works with both single-node and cluster Redis deployments
+- Standard TLS port for Redis is 6380 (plain text is 6379)
+
+**⚠️ Security Notes:**
+- Always use `tlsInsecureSkipVerify: false` in production
+- Provide `tlsCABundle` when using self-signed certificates
+- Ensure Redis/Valkey is configured with valid TLS certificates
+- Use proper certificate management (cert-manager, Vault, etc.)
 
 ## Redis Data Management
 
@@ -198,6 +246,13 @@ kubectl exec -n traefik redis-0 -- redis-cli --user default -a password \
 - WARNING for Redis failures (fail-open)
 
 ## Version History
+
+### v0.1.11 (2026-01-28)
+- Added TLS/SSL support for Redis/Valkey connections
+- Supports both single-node and cluster TLS connections
+- Configurable CA bundle for certificate verification
+- Optional insecure skip verify for testing environments
+- Backwards compatible with non-TLS deployments
 
 ### v0.1.10 (2026-01-27)
 - Added Redis username (ACL) support for Redis 6+
