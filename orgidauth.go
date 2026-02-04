@@ -5,96 +5,338 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
+	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
+var (
+	smallBufPool = sync.Pool{
+		New: func() interface{} { return make([]byte, smallBufferSize) },
+	}
+	mediumBufPool = sync.Pool{
+		New: func() interface{} { return make([]byte, mediumBufferSize) },
+	}
+	largeBufPool = sync.Pool{
+		New: func() interface{} { return make([]byte, largeBufferSize) },
+	}
+)
+
+func getSmallBuf() []byte {
+	if v := smallBufPool.Get(); v != nil {
+		if b, ok := v.([]byte); ok {
+			return b
+		}
+	}
+	return make([]byte, smallBufferSize)
+}
+
+func putSmallBuf(b []byte) {
+	if b != nil && len(b) == smallBufferSize {
+		smallBufPool.Put(b)
+	}
+}
+
+func getMediumBuf() []byte {
+	if v := mediumBufPool.Get(); v != nil {
+		if b, ok := v.([]byte); ok {
+			return b
+		}
+	}
+	return make([]byte, mediumBufferSize)
+}
+
+func putMediumBuf(b []byte) {
+	if b != nil && len(b) == mediumBufferSize {
+		mediumBufPool.Put(b)
+	}
+}
+
+func getLargeBuf() []byte {
+	if v := largeBufPool.Get(); v != nil {
+		if b, ok := v.([]byte); ok {
+			return b
+		}
+	}
+	return make([]byte, largeBufferSize)
+}
+
+func putLargeBuf(b []byte) {
+	if b != nil && len(b) == largeBufferSize {
+		largeBufPool.Put(b)
+	}
+}
+
+func logJSON(level, msg string, fields map[string]interface{}) {
+	entry := map[string]interface{}{
+		"time":   time.Now().UTC().Format(time.RFC3339),
+		"level":  level,
+		"msg":    msg,
+		"logger": "benji",
+	}
+	for k, v := range fields {
+		entry[k] = v
+	}
+	if data, err := json.Marshal(entry); err == nil {
+		os.Stdout.WriteString(string(data) + "\n")
+	}
+}
+
 type Config struct {
-	RedisAddr           string `json:"redisAddr,omitempty"`
-	RedisUsername       string `json:"redisUsername,omitempty"`
-	RedisPassword       string `json:"redisPassword,omitempty"`
-	OrgHeader           string `json:"orgHeader,omitempty"`
-	PoolSize            int    `json:"poolSize,omitempty"`
-	MaxConnIdleTime     string `json:"maxConnIdleTime,omitempty"`
-	PoolWaitTimeout     string `json:"poolWaitTimeout,omitempty"`
-	CacheTTL            string `json:"cacheTTL,omitempty"`
-	CacheMaxSize        int    `json:"cacheMaxSize,omitempty"`
-	ClusterMode         bool   `json:"clusterMode,omitempty"`
-	TLSEnabled          bool   `json:"tlsEnabled,omitempty"`
-	TLSCABundle         string `json:"tlsCABundle,omitempty"`
-	TLSInsecureSkipVerify bool `json:"tlsInsecureSkipVerify,omitempty"`
+	RedisAddr       string `json:"redisAddr,omitempty"`
+	RedisUsername   string `json:"redisUsername,omitempty"`
+	RedisPassword   string `json:"redisPassword,omitempty"`
+	OrgHeader       string `json:"orgHeader,omitempty"`
+	PoolSize        int    `json:"poolSize,omitempty"`
+	MaxConnIdleTime string `json:"maxConnIdleTime,omitempty"`
+	PoolWaitTimeout string `json:"poolWaitTimeout,omitempty"`
+	CacheTTL        string `json:"cacheTTL,omitempty"`
+	CacheMaxSize    int    `json:"cacheMaxSize,omitempty"`
+	ClusterMode     bool   `json:"clusterMode,omitempty"`
+	TLSMode         string `json:"tlsMode,omitempty"`
+	KeyPrefix       string `json:"keyPrefix,omitempty"`
+	FailOpen        bool   `json:"failOpen,omitempty"`
+	RequestTimeout  string `json:"requestTimeout,omitempty"`
 }
 
 func CreateConfig() *Config {
 	return &Config{
-		RedisAddr:             "valkey-redis-master.traefik.svc.cluster.local:6379",
-		RedisUsername:         "",
-		RedisPassword:         "traefik",
-		OrgHeader:             "X-Org",
-		PoolSize:              10,
-		MaxConnIdleTime:       "5m",
-		PoolWaitTimeout:       "2s",
-		CacheTTL:              "30s",
-		CacheMaxSize:          1000,
-		ClusterMode:           false,
-		TLSEnabled:            false,
-		TLSCABundle:           "",
-		TLSInsecureSkipVerify: false,
+		RedisAddr:       "valkey-redis-master.traefik.svc.cluster.local:6379",
+		RedisUsername:   "",
+		RedisPassword:   "traefik",
+		OrgHeader:       "X-Org",
+		PoolSize:        500,
+		MaxConnIdleTime: "5m",
+		PoolWaitTimeout: "500ms",
+		CacheTTL:        "10m",
+		CacheMaxSize:    100000,
+		ClusterMode:     true,
+		TLSMode:         "secure",
+		KeyPrefix:       "uuid",
+		FailOpen:        true,
+		RequestTimeout:  "5s",
 	}
 }
 
-// Connection represents a Redis connection
-type Connection struct {
-	fd       int       // Used for non-TLS connections
-	conn     net.Conn  // Used for TLS connections
-	lastUsed time.Time
-	inUse    bool
-	isTLS    bool      // Track connection type
+func (c *Config) Validate() error {
+	if c.PoolSize <= 0 {
+		return fmt.Errorf("poolSize must be positive, got %d", c.PoolSize)
+	}
+	if c.CacheMaxSize <= 0 {
+		return fmt.Errorf("cacheMaxSize must be positive, got %d", c.CacheMaxSize)
+	}
+	if c.OrgHeader == "" {
+		return fmt.Errorf("orgHeader cannot be empty")
+	}
+	if _, err := time.ParseDuration(c.MaxConnIdleTime); err != nil {
+		return fmt.Errorf("invalid maxConnIdleTime '%s': %w", c.MaxConnIdleTime, err)
+	}
+	if _, err := time.ParseDuration(c.PoolWaitTimeout); err != nil {
+		return fmt.Errorf("invalid poolWaitTimeout '%s': %w", c.PoolWaitTimeout, err)
+	}
+	if _, err := time.ParseDuration(c.CacheTTL); err != nil {
+		return fmt.Errorf("invalid cacheTTL '%s': %w", c.CacheTTL, err)
+	}
+	if _, err := time.ParseDuration(c.RequestTimeout); err != nil {
+		return fmt.Errorf("invalid requestTimeout '%s': %w", c.RequestTimeout, err)
+	}
+	if c.TLSMode == "" {
+		c.TLSMode = "secure"
+	}
+	if c.TLSMode != "disabled" && c.TLSMode != "secure" && c.TLSMode != "insecure" {
+		return fmt.Errorf("tlsMode must be 'disabled', 'secure', or 'insecure', got '%s'", c.TLSMode)
+	}
+	if c.KeyPrefix == "" {
+		c.KeyPrefix = "uuid"
+	}
+	return nil
 }
 
-// ConnectionPool manages Redis connections
+type Connection struct {
+	conn     net.Conn
+	lastUsed time.Time
+	inUse    bool
+}
+
 type ConnectionPool struct {
 	connections     []*Connection
+	pendingCount    int
 	mutex           sync.Mutex
+	available       chan struct{}
 	redisAddr       string
 	redisUsername   string
 	redisPassword   string
 	poolSize        int
 	maxConnIdleTime time.Duration
 	poolWaitTimeout time.Duration
-	tlsConfig       *tls.Config
-	tlsEnabled      bool
+	tlsMode         string
+	closing         bool
 }
 
-// CacheEntry stores cached IP validation results
 type CacheEntry struct {
 	allowed   bool
 	expiresAt time.Time
+	lastUsed  time.Time
 }
 
-// IPCache caches IP validation results per org
 type IPCache struct {
-	entries  map[string]*CacheEntry // key: "orgID:clientIP"
+	entries  map[string]*CacheEntry
+	mutex    sync.RWMutex
+	maxSize  int
+	cacheTTL time.Duration
+}
+
+type OrgAllowlistEntry struct {
+	exactIPs    map[string]struct{}
+	parsedCIDRs []*net.IPNet
+	expiresAt   time.Time
+	lastUsed    time.Time
+}
+
+type OrgAllowlistCache struct {
+	entries  map[string]*OrgAllowlistEntry
 	mutex    sync.RWMutex
 	maxSize  int
 	cacheTTL time.Duration
 }
 
 type OrgIDAuth struct {
-	next        http.Handler
-	orgHeader   string
-	name        string
-	pool        *ConnectionPool
-	cache       *IPCache
-	clusterMode bool
+	next              http.Handler
+	orgHeader         string
+	name              string
+	pool              *ConnectionPool
+	cache             *IPCache
+	orgAllowlistCache *OrgAllowlistCache
+	clusterMode       bool
+	tlsMode           string
+	keyPrefix         string
+	failOpen          bool
+	requestTimeout    time.Duration
+}
+
+const (
+	redisReadTimeout    = 1 * time.Second
+	redisWriteTimeout   = 1 * time.Second
+	redisConnectTimeout = 2 * time.Second
+	tcpKeepAlivePeriod  = 30 * time.Second
+	poolRetryInterval   = 10 * time.Millisecond
+)
+
+const (
+	smallBufferSize  = 1024
+	mediumBufferSize = 65536
+	largeBufferSize  = 131072
+)
+
+const (
+	orgAllowlistCacheMaxSize = 100
+	cacheEvictionPercent     = 10
+	minEvictionCount         = 1
+)
+
+func writeWithTimeout(conn net.Conn, data []byte) (int, error) {
+	if err := conn.SetWriteDeadline(time.Now().Add(redisWriteTimeout)); err != nil {
+		return 0, fmt.Errorf("set write deadline: %w", err)
+	}
+	n, err := conn.Write(data)
+	conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		return n, fmt.Errorf("write: %w", err)
+	}
+	return n, nil
+}
+
+func readWithTimeout(conn net.Conn, buf []byte) (int, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(redisReadTimeout)); err != nil {
+		return 0, fmt.Errorf("set read deadline: %w", err)
+	}
+	n, err := conn.Read(buf)
+	conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return n, fmt.Errorf("read: %w", err)
+	}
+	return n, nil
+}
+
+func setTCPKeepAlive(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			return
+		}
+		if err := tcpConn.SetKeepAlivePeriod(tcpKeepAlivePeriod); err != nil {
+		}
+		return
+	}
+
+}
+
+func (o *OrgIDAuth) handleMovedRedirectBool(response string, retryFn func(net.Conn) bool) (bool, bool) {
+	if !strings.HasPrefix(response, "-MOVED") {
+		return false, false
+	}
+
+	parts := strings.Fields(response)
+	if len(parts) < 3 {
+		return false, false
+	}
+
+	nodeAddr := parts[2]
+	nodeConn, err := o.connectToNode(nodeAddr)
+	if err != nil {
+		return false, false
+	}
+	defer nodeConn.Close()
+
+	result := retryFn(nodeConn)
+	return result, true
+}
+
+func (o *OrgIDAuth) handleMovedRedirectStringSlice(response string, retryFn func(net.Conn) ([]string, error)) ([]string, error, bool) {
+	if !strings.HasPrefix(response, "-MOVED") {
+		return nil, nil, false
+	}
+
+	parts := strings.Fields(response)
+	if len(parts) < 3 {
+		return nil, fmt.Errorf("malformed MOVED response: %s", response), true
+	}
+
+	nodeAddr := parts[2]
+	nodeConn, err := o.connectToNode(nodeAddr)
+	if err != nil {
+		return nil, fmt.Errorf("connect to node after MOVED redirect: %w", err), true
+	}
+	defer nodeConn.Close()
+
+	result, err := retryFn(nodeConn)
+	return result, err, true
+}
+
+func (o *OrgIDAuth) handleMovedRedirectInt(response string, retryFn func(net.Conn) int) (int, bool) {
+	if !strings.HasPrefix(response, "-MOVED") {
+		return 0, false
+	}
+
+	parts := strings.Fields(response)
+	if len(parts) < 3 {
+		return -1, false
+	}
+
+	nodeAddr := parts[2]
+	nodeConn, err := o.connectToNode(nodeAddr)
+	if err != nil {
+		return -1, false
+	}
+	defer nodeConn.Close()
+
+	result := retryFn(nodeConn)
+	return result, true
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
@@ -102,7 +344,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		config = CreateConfig()
 	}
 
-	// Parse duration strings
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
 	maxConnIdleTime, err := time.ParseDuration(config.MaxConnIdleTime)
 	if err != nil {
 		maxConnIdleTime = 5 * time.Minute
@@ -118,33 +363,23 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		cacheTTL = 30 * time.Second
 	}
 
-	// Initialize TLS configuration if enabled
-	var tlsConfig *tls.Config
-	if config.TLSEnabled {
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: config.TLSInsecureSkipVerify,
-		}
-
-		// Load CA bundle if provided
-		if config.TLSCABundle != "" {
-			caCertPool := x509.NewCertPool()
-			if ok := caCertPool.AppendCertsFromPEM([]byte(config.TLSCABundle)); !ok {
-				return nil, fmt.Errorf("failed to parse CA bundle")
-			}
-			tlsConfig.RootCAs = caCertPool
-		}
+	requestTimeout, err := time.ParseDuration(config.RequestTimeout)
+	if err != nil {
+		requestTimeout = 5 * time.Second
 	}
 
 	pool := &ConnectionPool{
 		connections:     make([]*Connection, 0, config.PoolSize),
+		pendingCount:    0,
+		available:       make(chan struct{}, 1),
 		redisAddr:       config.RedisAddr,
 		redisUsername:   config.RedisUsername,
 		redisPassword:   config.RedisPassword,
 		poolSize:        config.PoolSize,
 		maxConnIdleTime: maxConnIdleTime,
 		poolWaitTimeout: poolWaitTimeout,
-		tlsConfig:       tlsConfig,
-		tlsEnabled:      config.TLSEnabled,
+		tlsMode:         config.TLSMode,
+		closing:         false,
 	}
 
 	cache := &IPCache{
@@ -153,27 +388,50 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		cacheTTL: cacheTTL,
 	}
 
+	orgAllowlistCache := &OrgAllowlistCache{
+		entries:  make(map[string]*OrgAllowlistEntry),
+		maxSize:  orgAllowlistCacheMaxSize,
+		cacheTTL: cacheTTL,
+	}
+
 	return &OrgIDAuth{
-		next:        next,
-		orgHeader:   config.OrgHeader,
-		name:        name,
-		pool:        pool,
-		cache:       cache,
-		clusterMode: config.ClusterMode,
+		next:              next,
+		orgHeader:         config.OrgHeader,
+		name:              name,
+		pool:              pool,
+		cache:             cache,
+		orgAllowlistCache: orgAllowlistCache,
+		clusterMode:       config.ClusterMode,
+		tlsMode:           config.TLSMode,
+		keyPrefix:         config.KeyPrefix,
+		failOpen:          config.FailOpen,
+		requestTimeout:    requestTimeout,
 	}, nil
 }
 
 func (o *OrgIDAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if req.Method == http.MethodOptions {
+		o.next.ServeHTTP(rw, req)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(req.Context(), o.requestTimeout)
+	defer cancel()
+
+	select {
+	case <-ctx.Done():
+		http.Error(rw, "Request cancelled", http.StatusRequestTimeout)
+		return
+	default:
+	}
+
 	clientIP := getClientIP(req)
 
-	// Get all X-Org headers sent by JWT middleware (can be multiple headers)
 	orgHeaders := req.Header.Values(o.orgHeader)
 	var orgIDs []string
 
-	// Process each X-Org header
 	for _, orgHeader := range orgHeaders {
 		if orgHeader != "" {
-			// Handle comma-separated values in single header
 			if strings.Contains(orgHeader, ",") {
 				for _, orgID := range strings.Split(orgHeader, ",") {
 					trimmed := strings.TrimSpace(orgID)
@@ -182,7 +440,6 @@ func (o *OrgIDAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					}
 				}
 			} else {
-				// Single org ID
 				trimmed := strings.TrimSpace(orgHeader)
 				if trimmed != "" {
 					orgIDs = append(orgIDs, trimmed)
@@ -192,534 +449,529 @@ func (o *OrgIDAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	if len(orgIDs) == 0 {
-		http.Error(rw, "Missing org ID", http.StatusUnauthorized)
+		o.next.ServeHTTP(rw, req)
 		return
 	}
 
-	// Check if ANY org allows this IP
 	for _, orgID := range orgIDs {
-		// Try cache first
-		cacheKey := fmt.Sprintf("%s:%s", orgID, clientIP)
+
+		select {
+		case <-ctx.Done():
+			http.Error(rw, "Request timeout", http.StatusRequestTimeout)
+			return
+		default:
+		}
+
+		cacheKey := orgID + ":" + clientIP
 		if cached, ok := o.cache.get(cacheKey); ok {
 			if cached {
-				// Access granted - no logging needed (Traefik logs success in access logs)
 				o.next.ServeHTTP(rw, req)
 				return
 			}
-			// Cache says denied, try next org
 			continue
 		}
 
-		// Cache miss - check with Redis
-		allowed, shouldCache := o.isIPAllowedForOrg(orgID, clientIP)
+		allowed, shouldCache := o.isIPAllowedForOrg(ctx, orgID, clientIP)
 
-		// Only cache successful queries (not connection failures)
 		if shouldCache {
 			o.cache.set(cacheKey, allowed, time.Now().Add(o.cache.cacheTTL))
 		}
 
 		if allowed {
-			// Access granted - no logging needed (Traefik logs success in access logs)
 			o.next.ServeHTTP(rw, req)
 			return
 		}
 	}
 
-	log.Printf("[ORGID-AUTH] Access denied for IP %s - no organization allows this IP", clientIP)
 	http.Error(rw, "IP not allowed for any organization", http.StatusForbidden)
 }
 
-func (o *OrgIDAuth) isIPAllowedForOrg(orgID, clientIP string) (bool, bool) {
-	// Get connection from pool
-	conn, err := o.pool.getConnection()
-	if err != nil {
-		log.Printf("[ORGID-AUTH] WARNING: Redis connection pool exhausted for org %s - fail-open: allowing access", orgID)
-		return true, false // Fail-open: allow access on connection failures, but don't cache
-	}
+func (o *OrgIDAuth) isIPAllowedForOrg(ctx context.Context, orgID, clientIP string) (bool, bool) {
+	var exactIPs map[string]struct{}
+	var parsedCIDRs []*net.IPNet
 
-	// Track if connection failed, so we can remove it from pool
-	connFailed := false
-	defer func() {
-		if connFailed {
-			o.pool.removeConnection(conn)
-		} else {
-			o.pool.returnConnection(conn)
+	if cachedIPs, cachedCIDRs, ok := o.orgAllowlistCache.get(orgID); ok {
+		exactIPs = cachedIPs
+		parsedCIDRs = cachedCIDRs
+	} else {
+
+		select {
+		case <-ctx.Done():
+			return o.failOpen, false
+		default:
 		}
-	}()
 
-	// Build the key for this org's allowed IPs set
-	key := fmt.Sprintf("uuid:%s:allowed", orgID)
+		conn, err := o.pool.getConnectionWithContext(ctx)
+		if err != nil {
+			return o.failOpen, false
+		}
 
-	// Check if the key exists first
-	exists := o.redisExists(conn, key)
-
-	// Check if Redis command failed (connection issue)
-	if exists < 0 {
-		connFailed = true
-		log.Printf("[ORGID-AUTH] WARNING: Redis unavailable for org %s - fail-open: allowing access", orgID)
-		return true, false // Fail-open: allow access on connection failures, but don't cache
-	}
-
-	if exists == 0 {
-		// Fail-open policy: allow requests when org ID not found in Redis
-		return true, true // Cache this result
-	}
-
-	// First try exact IP match (fast path)
-	if o.redisSIsMember(conn, key, clientIP) {
-		return true, true // IP found in set, allow access
-	}
-
-	// If no exact match, check CIDR blocks
-	members := o.redisSMembers(conn, key)
-	if members == nil {
-		// Error fetching members
-		connFailed = true
-		log.Printf("[ORGID-AUTH] WARNING: Failed to fetch members for org %s - fail-open: allowing access", orgID)
-		return true, false
-	}
-
-	// Parse client IP
-	clientIPParsed := net.ParseIP(clientIP)
-	if clientIPParsed == nil {
-		log.Printf("[ORGID-AUTH] Invalid client IP format: %s", clientIP)
-		return false, true
-	}
-
-	// Check if client IP matches any CIDR block
-	for _, member := range members {
-		if strings.Contains(member, "/") {
-			// It's a CIDR block
-			_, ipnet, err := net.ParseCIDR(member)
-			if err != nil {
-				log.Printf("[ORGID-AUTH] Invalid CIDR format in Redis: %s", member)
-				continue
+		connFailed := false
+		defer func() {
+			if connFailed {
+				o.pool.removeConnection(conn)
+			} else {
+				o.pool.returnConnection(conn)
 			}
+		}()
+
+		key := fmt.Sprintf("%s:{%s}:allowed", o.keyPrefix, orgID)
+
+		members, err := o.redisSMembers(conn.conn, key)
+		if err != nil {
+			connFailed = true
+			return o.failOpen, false
+		}
+
+		if len(members) == 0 {
+			o.orgAllowlistCache.set(orgID, members, time.Now().Add(o.orgAllowlistCache.cacheTTL))
+			return true, true
+		}
+
+		o.orgAllowlistCache.set(orgID, members, time.Now().Add(o.orgAllowlistCache.cacheTTL))
+		exactIPs, parsedCIDRs, _ = o.orgAllowlistCache.get(orgID)
+	}
+
+	if len(exactIPs) == 0 && len(parsedCIDRs) == 0 {
+		return true, true
+	}
+
+	if _, found := exactIPs[clientIP]; found {
+		return true, true
+	}
+
+	if len(parsedCIDRs) > 0 {
+		clientIPParsed := net.ParseIP(clientIP)
+		if clientIPParsed == nil {
+			return false, true
+		}
+
+		for _, ipnet := range parsedCIDRs {
 			if ipnet.Contains(clientIPParsed) {
-				return true, true // IP matches CIDR block
+				return true, true
 			}
 		}
 	}
 
-	return false, true // Cache this result (IP not in list or CIDR ranges)
+	return false, true
 }
 
-// connectToNode creates an authenticated connection to a specific cluster node
-func (o *OrgIDAuth) connectToNode(nodeAddr string) (*Connection, error) {
-	// If TLS is enabled, use TLS connection
-	if o.pool.tlsEnabled {
-		dialer := &net.Dialer{
-			Timeout: 5 * time.Second,
-		}
-
-		conn, err := tls.DialWithDialer(dialer, "tcp", nodeAddr, o.pool.tlsConfig)
-		if err != nil {
-			return nil, fmt.Errorf("TLS connection failed: %v", err)
-		}
-
-		// Perform TLS handshake
-		if err := conn.Handshake(); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("TLS handshake failed: %v", err)
-		}
-
-		// Authenticate if needed
-		if o.pool.redisPassword != "" {
-			var authCmd string
-			if o.pool.redisUsername != "" {
-				// AUTH username password (Redis 6+)
-				authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-					len(o.pool.redisUsername), o.pool.redisUsername,
-					len(o.pool.redisPassword), o.pool.redisPassword)
-			} else {
-				// AUTH password (Redis < 6)
-				authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
-			}
-			if _, err = conn.Write([]byte(authCmd)); err != nil {
-				conn.Close()
-				return nil, err
-			}
-
-			buf := make([]byte, 1024)
-			n, err := conn.Read(buf)
-			if err != nil || !strings.Contains(string(buf[:n]), "+OK") {
-				conn.Close()
-				return nil, fmt.Errorf("auth failed")
-			}
-		}
-
-		return &Connection{
-			conn:     conn,
-			lastUsed: time.Now(),
-			inUse:    false,
-			isTLS:    true,
-		}, nil
-	}
-
-	// Plain TCP connection
-	host, portStr, err := net.SplitHostPort(nodeAddr)
-	if err != nil {
-		return nil, fmt.Errorf("parse address: %v", err)
-	}
-
-	port, err := strconv.Atoi(portStr)
+func (o *OrgIDAuth) redisSMembers(conn net.Conn, key string) ([]string, error) {
+	members, response, err := o.redisSMembersInternal(conn, key)
 	if err != nil {
 		return nil, err
 	}
 
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return nil, fmt.Errorf("resolve %s: %v", host, err)
+	if o.clusterMode {
+		if result, err, wasRedirected := o.handleMovedRedirectStringSlice(response, func(nodeConn net.Conn) ([]string, error) {
+			m, _, e := o.redisSMembersInternal(nodeConn, key)
+			return m, e
+		}); wasRedirected {
+			return result, err
+		}
 	}
 
-	var ip net.IP
-	for _, i := range ips {
-		if i.To4() != nil {
-			ip = i.To4()
+	return members, nil
+}
+
+func (o *OrgIDAuth) redisSMembersInternal(conn net.Conn, key string) ([]string, string, error) {
+	cmd := fmt.Sprintf("*2\r\n$8\r\nSMEMBERS\r\n$%d\r\n%s\r\n", len(key), key)
+	_, err := writeWithTimeout(conn, []byte(cmd))
+	if err != nil {
+		return nil, "", fmt.Errorf("write SMEMBERS command for key %s: %w", key, err)
+	}
+
+	buf := getMediumBuf()
+	defer putMediumBuf(buf)
+	n, err := readWithTimeout(conn, buf)
+	if err != nil {
+		return nil, "", fmt.Errorf("read SMEMBERS response for key %s: %w", key, err)
+	}
+
+	dataCopy := make([]byte, n)
+	copy(dataCopy, buf[:n])
+
+	reader := bufio.NewReader(bytes.NewReader(dataCopy))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, "", fmt.Errorf("parse SMEMBERS response: %w", err)
+	}
+
+	response = strings.TrimSpace(response)
+
+	if strings.HasPrefix(response, "-MOVED") {
+		return nil, response, nil
+	}
+
+	if !strings.HasPrefix(response, "*") {
+		return nil, response, fmt.Errorf("invalid SMEMBERS response format: %s", response)
+	}
+
+	countStr := response[1:]
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		return nil, response, fmt.Errorf("parse SMEMBERS count: %w", err)
+	}
+	if count == 0 {
+		return []string{}, response, nil
+	}
+
+	members := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		lenLine, err := reader.ReadString('\n')
+		if err != nil {
 			break
 		}
-	}
-	if ip == nil {
-		ip = ips[0]
-	}
-
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	sa := &syscall.SockaddrInet4{Port: port}
-	copy(sa.Addr[:], ip.To4())
-
-	if err := syscall.Connect(fd, sa); err != nil {
-		syscall.Close(fd)
-		return nil, fmt.Errorf("connect: %v", err)
-	}
-
-	// Authenticate if needed
-	if o.pool.redisPassword != "" {
-		var authCmd string
-		if o.pool.redisUsername != "" {
-			// AUTH username password (Redis 6+)
-			authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-				len(o.pool.redisUsername), o.pool.redisUsername,
-				len(o.pool.redisPassword), o.pool.redisPassword)
-		} else {
-			// AUTH password (Redis < 6)
-			authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
+		lenLine = strings.TrimSpace(lenLine)
+		if !strings.HasPrefix(lenLine, "$") {
+			continue
 		}
-		if _, err = syscall.Write(fd, []byte(authCmd)); err != nil {
-			syscall.Close(fd)
+
+		lengthStr := lenLine[1:]
+		length, err := strconv.Atoi(lengthStr)
+		if err != nil || length < 0 {
+			continue
+		}
+
+		memberBytes := make([]byte, length+2)
+		_, err = reader.Read(memberBytes)
+		if err != nil {
+			break
+		}
+
+		member := string(memberBytes[:length])
+		members = append(members, member)
+	}
+
+	return members, response, nil
+}
+
+func (o *OrgIDAuth) redisKeys(conn net.Conn, pattern string) []string {
+	if !o.clusterMode {
+		return o.redisKeysSingleNode(conn, pattern)
+	}
+
+	return o.redisKeysCluster(conn, pattern)
+}
+
+func (o *OrgIDAuth) redisKeysSingleNode(conn net.Conn, pattern string) []string {
+	cmd := fmt.Sprintf("*2\r\n$4\r\nKEYS\r\n$%d\r\n%s\r\n", len(pattern), pattern)
+	_, err := writeWithTimeout(conn, []byte(cmd))
+	if err != nil {
+		logJSON("ERROR", "failed to write KEYS command", map[string]interface{}{
+			"error": err.Error(),
+		})
+		return nil
+	}
+
+	buf := getMediumBuf()
+	defer putMediumBuf(buf)
+	n, err := readWithTimeout(conn, buf)
+	if err != nil {
+		logJSON("ERROR", "failed to read KEYS response", map[string]interface{}{
+			"error": err.Error(),
+		})
+		return nil
+	}
+
+	dataCopy := make([]byte, n)
+	copy(dataCopy, buf[:n])
+
+	reader := bufio.NewReader(bytes.NewReader(dataCopy))
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		logJSON("ERROR", "failed to parse KEYS response", map[string]interface{}{
+			"error": err.Error(),
+		})
+		return nil
+	}
+
+	response = strings.TrimSpace(response)
+	if !strings.HasPrefix(response, "*") {
+		logJSON("ERROR", "invalid KEYS response format", map[string]interface{}{
+			"response": response,
+		})
+		return nil
+	}
+
+	countStr := response[1:]
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		logJSON("ERROR", "failed to parse KEYS count", map[string]interface{}{
+			"error": err.Error(),
+		})
+		return nil
+	}
+	if count == 0 {
+		return []string{}
+	}
+
+	keys := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		lenLine, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		lenLine = strings.TrimSpace(lenLine)
+		if !strings.HasPrefix(lenLine, "$") {
+			continue
+		}
+
+		lengthStr := lenLine[1:]
+		length, err := strconv.Atoi(lengthStr)
+		if err != nil || length < 0 {
+			continue
+		}
+
+		keyBytes := make([]byte, length+2)
+		_, err = reader.Read(keyBytes)
+		if err != nil {
+			break
+		}
+
+		key := string(keyBytes[:length])
+		keys = append(keys, key)
+	}
+
+	return keys
+}
+
+func (o *OrgIDAuth) redisKeysCluster(conn net.Conn, pattern string) []string {
+	nodes := o.getClusterNodes(conn)
+	if len(nodes) == 0 {
+		return o.redisKeysSingleNode(conn, pattern)
+	}
+
+	allKeys := make(map[string]bool)
+	for _, nodeAddr := range nodes {
+		nodeKeys := o.queryNodeForKeys(nodeAddr, pattern)
+		for _, key := range nodeKeys {
+			allKeys[key] = true
+		}
+	}
+
+	keys := make([]string, 0, len(allKeys))
+	for key := range allKeys {
+		keys = append(keys, key)
+	}
+
+	return keys
+}
+
+func (o *OrgIDAuth) getClusterNodes(conn net.Conn) []string {
+	cmd := "*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n"
+	_, err := writeWithTimeout(conn, []byte(cmd))
+	if err != nil {
+		logJSON("ERROR", "failed to write CLUSTER NODES command", map[string]interface{}{
+			"error": err.Error(),
+		})
+		return nil
+	}
+
+	buf := getLargeBuf()
+	defer putLargeBuf(buf)
+	n, err := readWithTimeout(conn, buf)
+	if err != nil {
+		logJSON("ERROR", "failed to read CLUSTER NODES response", map[string]interface{}{
+			"error": err.Error(),
+		})
+		return nil
+	}
+
+	response := string(buf[:n])
+
+	if !strings.HasPrefix(response, "$") {
+		logJSON("ERROR", "invalid CLUSTER NODES response format", map[string]interface{}{
+			"response": response[:min(100, len(response))],
+		})
+		return nil
+	}
+
+	lines := strings.Split(response, "\r\n")
+	if len(lines) < 2 {
+		return nil
+	}
+
+	nodesData := lines[1]
+
+	nodeLines := strings.Split(nodesData, "\n")
+	var nodes []string
+
+	for _, line := range nodeLines {
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 8 {
+			continue
+		}
+
+		addrParts := strings.Split(fields[1], "@")
+		if len(addrParts) > 0 {
+			addr := addrParts[0]
+
+			if !strings.Contains(fields[2], "slave") && !strings.Contains(fields[2], "replica") {
+				nodes = append(nodes, addr)
+			}
+		}
+	}
+
+	return nodes
+}
+
+func (o *OrgIDAuth) connectToNode(nodeAddr string) (net.Conn, error) {
+	var conn net.Conn
+	var err error
+
+	if o.tlsMode == "disabled" {
+		conn, err = net.DialTimeout("tcp", nodeAddr, redisConnectTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("connect to %s: %w", nodeAddr, err)
+		}
+	} else {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: o.tlsMode == "insecure",
+		}
+		dialer := &net.Dialer{Timeout: redisConnectTimeout}
+		conn, err = tls.DialWithDialer(dialer, "tcp", nodeAddr, tlsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("connect with TLS to %s: %w", nodeAddr, err)
+		}
+	}
+
+	setTCPKeepAlive(conn)
+
+	if o.pool.redisPassword != "" {
+		if err := o.authenticateConnection(conn); err != nil {
+			conn.Close()
 			return nil, err
 		}
-
-		buf := make([]byte, 1024)
-		n, err := syscall.Read(fd, buf)
-		if err != nil || !strings.Contains(string(buf[:n]), "+OK") {
-			syscall.Close(fd)
-			return nil, fmt.Errorf("auth failed")
-		}
 	}
 
-	return &Connection{
-		fd:       fd,
-		lastUsed: time.Now(),
-		inUse:    false,
-		isTLS:    false,
-	}, nil
+	return conn, nil
 }
 
-// Redis SISMEMBER command with cluster support
-func (o *OrgIDAuth) redisSIsMember(conn *Connection, key, member string) bool {
-	if !o.clusterMode {
-		return o.redisSIsMemberSingleNode(conn, key, member)
+func (o *OrgIDAuth) authenticateConnection(conn net.Conn) error {
+	var authCmd string
+	if o.pool.redisUsername != "" {
+		authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+			len(o.pool.redisUsername), o.pool.redisUsername,
+			len(o.pool.redisPassword), o.pool.redisPassword)
+	} else {
+		authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(o.pool.redisPassword), o.pool.redisPassword)
 	}
-	return o.redisSIsMemberCluster(conn, key, member)
+
+	if _, err := writeWithTimeout(conn, []byte(authCmd)); err != nil {
+		return fmt.Errorf("write AUTH command: %w", err)
+	}
+
+	buf := getSmallBuf()
+	defer putSmallBuf(buf)
+	n, err := readWithTimeout(conn, buf)
+	if err != nil {
+		return fmt.Errorf("read AUTH response: %w", err)
+	}
+
+	if !strings.Contains(string(buf[:n]), "+OK") {
+		return fmt.Errorf("authentication failed")
+	}
+
+	return nil
 }
 
-// Redis SISMEMBER for cluster mode - handles MOVED redirects
-func (o *OrgIDAuth) redisSIsMemberCluster(conn *Connection, key, member string) bool {
-	// Try the connected node first
+func (o *OrgIDAuth) queryNodeForKeys(nodeAddr, pattern string) []string {
+	conn, err := o.connectToNode(nodeAddr)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+
+	return o.redisKeysSingleNode(conn, pattern)
+}
+
+func (o *OrgIDAuth) redisSIsMember(conn net.Conn, key, member string) bool {
 	cmd := fmt.Sprintf("*3\r\n$9\r\nSISMEMBER\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
 		len(key), key, len(member), member)
-	_, err := connWrite(conn, []byte(cmd))
+	_, err := writeWithTimeout(conn, []byte(cmd))
 	if err != nil {
-		log.Printf("[ORGID-AUTH] Error writing SISMEMBER command: %v", err)
+		logJSON("ERROR", "failed to write SISMEMBER command", map[string]interface{}{
+			"key":    key,
+			"member": member,
+			"error":  err.Error(),
+		})
 		return false
 	}
 
-	// Read response
-	buf := make([]byte, 1024)
-	n, err := connRead(conn, buf)
+	buf := getSmallBuf()
+	defer putSmallBuf(buf)
+	n, err := readWithTimeout(conn, buf)
 	if err != nil {
-		log.Printf("[ORGID-AUTH] Error reading SISMEMBER response: %v", err)
+		logJSON("ERROR", "failed to read SISMEMBER response", map[string]interface{}{
+			"error": err.Error(),
+		})
 		return false
 	}
 
 	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
 	response, err := reader.ReadString('\n')
 	if err != nil {
-		log.Printf("[ORGID-AUTH] Error parsing SISMEMBER response: %v", err)
+		logJSON("ERROR", "failed to parse SISMEMBER response", map[string]interface{}{
+			"error": err.Error(),
+		})
 		return false
 	}
 
-	// Check for MOVED redirect
-	if strings.HasPrefix(response, "-MOVED") {
-		// Extract new node address from MOVED response
-		parts := strings.Fields(response)
-		if len(parts) >= 3 {
-			nodeAddr := parts[2]
-			// Connect to the new node and retry
-			nodeConn, err := o.connectToNode(nodeAddr)
-			if err != nil {
-				log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
-				return false
-			}
-			defer connClose(nodeConn)
-			return o.redisSIsMemberSingleNode(nodeConn, key, member)
+	if o.clusterMode {
+		if result, wasRedirected := o.handleMovedRedirectBool(response, func(nodeConn net.Conn) bool {
+			return o.redisSIsMember(nodeConn, key, member)
+		}); wasRedirected {
+			return result
 		}
 	}
 
-	// Parse response (should be ":1" for member exists, ":0" for doesn't exist)
 	response = strings.TrimSpace(response)
 	return response == ":1"
 }
 
-// Redis SISMEMBER for single node
-func (o *OrgIDAuth) redisSIsMemberSingleNode(conn *Connection, key, member string) bool {
-	cmd := fmt.Sprintf("*3\r\n$9\r\nSISMEMBER\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-		len(key), key, len(member), member)
-	_, err := connWrite(conn, []byte(cmd))
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error writing SISMEMBER command: %v", err)
-		return false
-	}
-
-	// Read response
-	buf := make([]byte, 1024)
-	n, err := connRead(conn, buf)
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error reading SISMEMBER response: %v", err)
-		return false
-	}
-
-	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error parsing SISMEMBER response: %v", err)
-		return false
-	}
-
-	// Parse response (should be ":1" for member exists, ":0" for doesn't exist)
-	response = strings.TrimSpace(response)
-	return response == ":1"
-}
-
-// Redis SMEMBERS command with cluster support
-func (o *OrgIDAuth) redisSMembers(conn *Connection, key string) []string {
-	if !o.clusterMode {
-		return o.redisSMembersSingleNode(conn, key)
-	}
-	return o.redisSMembersCluster(conn, key)
-}
-
-// Redis SMEMBERS for single node
-func (o *OrgIDAuth) redisSMembersSingleNode(conn *Connection, key string) []string {
-	cmd := fmt.Sprintf("*2\r\n$8\r\nSMEMBERS\r\n$%d\r\n%s\r\n", len(key), key)
-	_, err := connWrite(conn, []byte(cmd))
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error writing SMEMBERS command: %v", err)
-		return nil
-	}
-
-	// Read response
-	buf := make([]byte, 8192) // Larger buffer for multiple members
-	n, err := connRead(conn, buf)
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error reading SMEMBERS response: %v", err)
-		return nil
-	}
-
-	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error parsing SMEMBERS response: %v", err)
-		return nil
-	}
-
-	// Parse array response
-	response = strings.TrimSpace(response)
-	if !strings.HasPrefix(response, "*") {
-		return nil
-	}
-
-	countStr := response[1:]
-	count, err := strconv.Atoi(countStr)
-	if err != nil {
-		return nil
-	}
-	if count == 0 {
-		return []string{}
-	}
-
-	members := make([]string, 0, count)
-	for i := 0; i < count; i++ {
-		// Read bulk string length line
-		lenLine, err := reader.ReadString('\n')
-		if err != nil {
-			break
-		}
-		lenLine = strings.TrimSpace(lenLine)
-		if !strings.HasPrefix(lenLine, "$") {
-			continue
-		}
-
-		// Parse length
-		lengthStr := lenLine[1:]
-		length, err := strconv.Atoi(lengthStr)
-		if err != nil || length < 0 {
-			continue
-		}
-
-		// Read exact number of bytes + \r\n
-		memberBytes := make([]byte, length+2)
-		_, err = reader.Read(memberBytes)
-		if err != nil {
-			break
-		}
-
-		// Extract member (without \r\n)
-		member := string(memberBytes[:length])
-		members = append(members, member)
-	}
-
-	return members
-}
-
-// Redis SMEMBERS for cluster mode - handles MOVED redirects
-func (o *OrgIDAuth) redisSMembersCluster(conn *Connection, key string) []string {
-	cmd := fmt.Sprintf("*2\r\n$8\r\nSMEMBERS\r\n$%d\r\n%s\r\n", len(key), key)
-	_, err := connWrite(conn, []byte(cmd))
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error writing SMEMBERS command: %v", err)
-		return nil
-	}
-
-	// Read response
-	buf := make([]byte, 8192)
-	n, err := connRead(conn, buf)
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error reading SMEMBERS response: %v", err)
-		return nil
-	}
-
-	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error parsing SMEMBERS response: %v", err)
-		return nil
-	}
-
-	// Check for MOVED redirect
-	if strings.HasPrefix(response, "-MOVED") {
-		// Extract new node address from MOVED response
-		parts := strings.Fields(response)
-		if len(parts) >= 3 {
-			nodeAddr := parts[2]
-			// Connect to the new node and retry
-			nodeConn, err := o.connectToNode(nodeAddr)
-			if err != nil {
-				log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
-				return nil
-			}
-			defer connClose(nodeConn)
-			return o.redisSMembersSingleNode(nodeConn, key)
-		}
-	}
-
-	// Parse array response
-	response = strings.TrimSpace(response)
-	if !strings.HasPrefix(response, "*") {
-		return nil
-	}
-
-	countStr := response[1:]
-	count, err := strconv.Atoi(countStr)
-	if err != nil {
-		return nil
-	}
-	if count == 0 {
-		return []string{}
-	}
-
-	members := make([]string, 0, count)
-	for i := 0; i < count; i++ {
-		// Read bulk string length line
-		lenLine, err := reader.ReadString('\n')
-		if err != nil {
-			break
-		}
-		lenLine = strings.TrimSpace(lenLine)
-		if !strings.HasPrefix(lenLine, "$") {
-			continue
-		}
-
-		// Parse length
-		lengthStr := lenLine[1:]
-		length, err := strconv.Atoi(lengthStr)
-		if err != nil || length < 0 {
-			continue
-		}
-
-		// Read exact number of bytes + \r\n
-		memberBytes := make([]byte, length+2)
-		_, err = reader.Read(memberBytes)
-		if err != nil {
-			break
-		}
-
-		// Extract member (without \r\n)
-		member := string(memberBytes[:length])
-		members = append(members, member)
-	}
-
-	return members
-}
-
-// Redis EXISTS command with cluster support
-// Returns: 1 if key exists, 0 if not exists, -1 on error
-func (o *OrgIDAuth) redisExists(conn *Connection, key string) int {
-	if !o.clusterMode {
-		return o.redisExistsSingleNode(conn, key)
-	}
-	return o.redisExistsCluster(conn, key)
-}
-
-// Redis EXISTS for single node
-func (o *OrgIDAuth) redisExistsSingleNode(conn *Connection, key string) int {
+func (o *OrgIDAuth) redisExists(conn net.Conn, key string) int {
 	cmd := fmt.Sprintf("*2\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key)
-	_, err := connWrite(conn, []byte(cmd))
+	_, err := writeWithTimeout(conn, []byte(cmd))
 	if err != nil {
-		log.Printf("[ORGID-AUTH] Error writing EXISTS command: %v", err)
+		logJSON("ERROR", "failed to write EXISTS command", map[string]interface{}{
+			"key":   key,
+			"error": err.Error(),
+		})
 		return -1
 	}
 
-	// Read response
-	buf := make([]byte, 1024)
-	n, err := connRead(conn, buf)
+	buf := getSmallBuf()
+	defer putSmallBuf(buf)
+	n, err := readWithTimeout(conn, buf)
 	if err != nil {
-		log.Printf("[ORGID-AUTH] Error reading EXISTS response: %v", err)
+		logJSON("ERROR", "failed to read EXISTS response", map[string]interface{}{
+			"error": err.Error(),
+		})
 		return -1
 	}
 
 	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
 	response, err := reader.ReadString('\n')
 	if err != nil {
-		log.Printf("[ORGID-AUTH] Error parsing EXISTS response: %v", err)
+		logJSON("ERROR", "failed to parse EXISTS response", map[string]interface{}{
+			"error": err.Error(),
+		})
 		return -1
 	}
 
-	// Parse response (should be ":1" for exists, ":0" for doesn't exist)
+	if o.clusterMode {
+		if result, wasRedirected := o.handleMovedRedirectInt(response, func(nodeConn net.Conn) int {
+			return o.redisExists(nodeConn, key)
+		}); wasRedirected {
+			return result
+		}
+	}
+
 	response = strings.TrimSpace(response)
 	if response == ":1" {
 		return 1
@@ -727,64 +979,10 @@ func (o *OrgIDAuth) redisExistsSingleNode(conn *Connection, key string) int {
 		return 0
 	}
 
-	return -1 // Parse error
+	return -1
 }
 
-// Redis EXISTS for cluster mode - handles MOVED redirects
-func (o *OrgIDAuth) redisExistsCluster(conn *Connection, key string) int {
-	cmd := fmt.Sprintf("*2\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key)
-	_, err := connWrite(conn, []byte(cmd))
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error writing EXISTS command: %v", err)
-		return -1
-	}
-
-	// Read response
-	buf := make([]byte, 1024)
-	n, err := connRead(conn, buf)
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error reading EXISTS response: %v", err)
-		return -1
-	}
-
-	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		log.Printf("[ORGID-AUTH] Error parsing EXISTS response: %v", err)
-		return -1
-	}
-
-	// Check for MOVED redirect
-	if strings.HasPrefix(response, "-MOVED") {
-		// Extract new node address from MOVED response
-		parts := strings.Fields(response)
-		if len(parts) >= 3 {
-			nodeAddr := parts[2]
-			// Connect to the new node and retry
-			nodeConn, err := o.connectToNode(nodeAddr)
-			if err != nil {
-				log.Printf("[ORGID-AUTH] Failed to connect to node %s: %v", nodeAddr, err)
-				return -1
-			}
-			defer connClose(nodeConn)
-			return o.redisExistsSingleNode(nodeConn, key)
-		}
-	}
-
-	// Parse response (should be ":1" for exists, ":0" for doesn't exist)
-	response = strings.TrimSpace(response)
-	if response == ":1" {
-		return 1
-	} else if response == ":0" {
-		return 0
-	}
-
-	return -1 // Parse error
-}
-
-// getClientIP implements Traefik's IP detection logic
 func getClientIP(req *http.Request) string {
-	// Try X-Forwarded-For header
 	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
 		ips := strings.Split(xff, ",")
 		if len(ips) > 0 {
@@ -795,12 +993,10 @@ func getClientIP(req *http.Request) string {
 		}
 	}
 
-	// Try X-Real-IP header
 	if xri := req.Header.Get("X-Real-IP"); xri != "" && isValidIP(xri) {
 		return xri
 	}
 
-	// Fall back to RemoteAddr
 	if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 		return host
 	}
@@ -811,98 +1007,205 @@ func isValidIP(ip string) bool {
 	return net.ParseIP(ip) != nil
 }
 
-// get retrieves a cached result if valid
 func (c *IPCache) get(key string) (bool, bool) {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
 	entry, exists := c.entries[key]
 	if !exists {
 		return false, false
 	}
 
-	// Check if expired
 	if time.Now().After(entry.expiresAt) {
+		delete(c.entries, key)
 		return false, false
 	}
+
+	entry.lastUsed = time.Now()
 
 	return entry.allowed, true
 }
 
-// set stores a validation result in cache
 func (c *IPCache) set(key string, allowed bool, expiresAt time.Time) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	// Simple eviction: if cache is full, clear oldest 10%
 	if len(c.entries) >= c.maxSize {
-		c.evictOldest()
+		c.evictLRU()
 	}
 
 	c.entries[key] = &CacheEntry{
 		allowed:   allowed,
 		expiresAt: expiresAt,
+		lastUsed:  time.Now(),
 	}
 }
 
-// evictOldest removes expired entries and oldest 10% if needed
-func (c *IPCache) evictOldest() {
+func (c *IPCache) evictLRU() {
 	now := time.Now()
-	toDelete := make([]string, 0)
 
-	// First, remove all expired entries
+	toDelete := make([]string, 0)
 	for key, entry := range c.entries {
 		if now.After(entry.expiresAt) {
 			toDelete = append(toDelete, key)
 		}
 	}
-
 	for _, key := range toDelete {
 		delete(c.entries, key)
 	}
 
-	// If still over capacity, remove 10% of entries
 	if len(c.entries) >= c.maxSize {
-		count := len(c.entries) / 10
-		if count < 1 {
-			count = 1
+		count := len(c.entries) / cacheEvictionPercent
+		if count < minEvictionCount {
+			count = minEvictionCount
 		}
-		removed := 0
-		for key := range c.entries {
-			delete(c.entries, key)
-			removed++
-			if removed >= count {
-				break
+
+		type lruEntry struct {
+			key      string
+			lastUsed time.Time
+		}
+
+		entries := make([]lruEntry, 0, len(c.entries))
+		for key, entry := range c.entries {
+			entries = append(entries, lruEntry{key: key, lastUsed: entry.lastUsed})
+		}
+
+		for i := 0; i < count && i < len(entries); i++ {
+			oldestIdx := i
+			for j := i + 1; j < len(entries); j++ {
+				if entries[j].lastUsed.Before(entries[oldestIdx].lastUsed) {
+					oldestIdx = j
+				}
 			}
+			if oldestIdx != i {
+				entries[i], entries[oldestIdx] = entries[oldestIdx], entries[i]
+			}
+			delete(c.entries, entries[i].key)
 		}
-		log.Printf("[ORGID-AUTH] Cache evicted %d entries (size: %d/%d)", removed, len(c.entries), c.maxSize)
 	}
 }
 
-// getConnection gets a connection from the pool
-func (p *ConnectionPool) getConnection() (*Connection, error) {
+func (c *OrgAllowlistCache) get(orgID string) (map[string]struct{}, []*net.IPNet, bool) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	entry, exists := c.entries[orgID]
+	if !exists {
+		return nil, nil, false
+	}
+
+	if time.Now().After(entry.expiresAt) {
+		delete(c.entries, orgID)
+		return nil, nil, false
+	}
+
+	entry.lastUsed = time.Now()
+
+	return entry.exactIPs, entry.parsedCIDRs, true
+}
+
+func (c *OrgAllowlistCache) set(orgID string, members []string, expiresAt time.Time) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if len(c.entries) >= c.maxSize {
+		c.evictLRU()
+	}
+
+	exactIPs := make(map[string]struct{}, len(members))
+	parsedCIDRs := make([]*net.IPNet, 0)
+
+	for _, member := range members {
+		if strings.Contains(member, "/") {
+			_, ipnet, err := net.ParseCIDR(member)
+			if err != nil {
+				continue
+			}
+			parsedCIDRs = append(parsedCIDRs, ipnet)
+		} else {
+			exactIPs[member] = struct{}{}
+		}
+	}
+
+	c.entries[orgID] = &OrgAllowlistEntry{
+		exactIPs:    exactIPs,
+		parsedCIDRs: parsedCIDRs,
+		expiresAt:   expiresAt,
+		lastUsed:    time.Now(),
+	}
+}
+
+func (c *OrgAllowlistCache) evictLRU() {
+	now := time.Now()
+
+	toDelete := make([]string, 0)
+	for key, entry := range c.entries {
+		if now.After(entry.expiresAt) {
+			toDelete = append(toDelete, key)
+		}
+	}
+	for _, key := range toDelete {
+		delete(c.entries, key)
+	}
+
+	if len(c.entries) >= c.maxSize {
+		count := len(c.entries) / cacheEvictionPercent
+		if count < minEvictionCount {
+			count = minEvictionCount
+		}
+
+		type lruEntry struct {
+			key      string
+			lastUsed time.Time
+		}
+
+		entries := make([]lruEntry, 0, len(c.entries))
+		for key, entry := range c.entries {
+			entries = append(entries, lruEntry{key: key, lastUsed: entry.lastUsed})
+		}
+
+		for i := 0; i < count && i < len(entries); i++ {
+			oldestIdx := i
+			for j := i + 1; j < len(entries); j++ {
+				if entries[j].lastUsed.Before(entries[oldestIdx].lastUsed) {
+					oldestIdx = j
+				}
+			}
+			if oldestIdx != i {
+				entries[i], entries[oldestIdx] = entries[oldestIdx], entries[i]
+			}
+			delete(c.entries, entries[i].key)
+		}
+	}
+}
+
+func (p *ConnectionPool) getConnectionWithContext(ctx context.Context) (*Connection, error) {
 	startTime := time.Now()
 
 	for {
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled: %w", ctx.Err())
+		default:
+		}
+
 		p.mutex.Lock()
 
-		// Find available connection and check if stale
-		for i, conn := range p.connections {
+		if p.closing {
+			p.mutex.Unlock()
+			return nil, fmt.Errorf("connection pool is closing")
+		}
+
+		for i := len(p.connections) - 1; i >= 0; i-- {
+			conn := p.connections[i]
 			if !conn.inUse {
-				// Check if connection is stale
 				if time.Since(conn.lastUsed) > p.maxConnIdleTime {
-					connType := "plain"
-					if conn.isTLS {
-						connType = "TLS"
-					}
-					log.Printf("[ORGID-AUTH] Removing stale %s connection (idle for %v)", connType, time.Since(conn.lastUsed))
-					connClose(conn)
-					// Remove stale connection
+					conn.conn.Close()
 					p.connections = append(p.connections[:i], p.connections[i+1:]...)
 					continue
 				}
 
-				// Connection is good, mark as in use
 				conn.inUse = true
 				conn.lastUsed = time.Now()
 				p.mutex.Unlock()
@@ -910,54 +1213,77 @@ func (p *ConnectionPool) getConnection() (*Connection, error) {
 			}
 		}
 
-		// Create new connection if pool not full
-		if len(p.connections) < p.poolSize {
+		if len(p.connections)+p.pendingCount < p.poolSize {
+			p.pendingCount++
+			p.mutex.Unlock()
+
 			conn, err := p.createConnection()
+
+			p.mutex.Lock()
+			p.pendingCount--
 			if err != nil {
 				p.mutex.Unlock()
-				return nil, err
+				logJSON("ERROR", "failed to create connection", map[string]interface{}{
+					"error": err.Error(),
+				})
+				return nil, fmt.Errorf("create connection: %w", err)
 			}
 			conn.inUse = true
 			p.connections = append(p.connections, conn)
 			p.mutex.Unlock()
+
+			select {
+			case p.available <- struct{}{}:
+			default:
+			}
+
 			return conn, nil
 		}
 
 		p.mutex.Unlock()
 
-		// Pool is exhausted, check if we should wait
-		if time.Since(startTime) >= p.poolWaitTimeout {
+		remaining := p.poolWaitTimeout - time.Since(startTime)
+		if remaining <= 0 {
 			return nil, fmt.Errorf("connection pool exhausted after %v wait", p.poolWaitTimeout)
 		}
 
-		// Wait a bit before retrying
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-p.available:
+
+			continue
+		case <-time.After(poolRetryInterval):
+
+			continue
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled while waiting for connection: %w", ctx.Err())
+		}
 	}
 }
 
-// returnConnection returns a connection to the pool
-func (p *ConnectionPool) returnConnection(conn *Connection) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	conn.inUse = false
-	conn.lastUsed = time.Now()
+func (p *ConnectionPool) getConnection() (*Connection, error) {
+	return p.getConnectionWithContext(context.Background())
 }
 
-// removeConnection removes and closes a failed connection from the pool
+func (p *ConnectionPool) returnConnection(conn *Connection) {
+	p.mutex.Lock()
+	conn.inUse = false
+	conn.lastUsed = time.Now()
+	p.mutex.Unlock()
+
+	select {
+	case p.available <- struct{}{}:
+	default:
+	}
+}
+
 func (p *ConnectionPool) removeConnection(conn *Connection) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	// Close the connection
-	if err := connClose(conn); err == nil {
-		if conn.isTLS {
-			log.Printf("[ORGID-AUTH] Closed failed TLS connection")
-		} else {
-			log.Printf("[ORGID-AUTH] Closed failed connection fd=%d", conn.fd)
-		}
+	if conn.conn != nil {
+		conn.conn.Close()
 	}
 
-	// Remove from pool
 	for i, c := range p.connections {
 		if c == conn {
 			p.connections = append(p.connections[:i], p.connections[i+1:]...)
@@ -966,74 +1292,114 @@ func (p *ConnectionPool) removeConnection(conn *Connection) {
 	}
 }
 
-// Close closes all connections in the pool
 func (p *ConnectionPool) Close() {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
+	p.closing = true
+
 	for _, conn := range p.connections {
-		if err := connClose(conn); err == nil {
-			connType := "plain"
-			if conn.isTLS {
-				connType = "TLS"
-			}
-			log.Printf("[ORGID-AUTH] Closed %s connection during shutdown", connType)
+		if conn != nil && conn.conn != nil {
+			conn.conn.Close()
 		}
 	}
 	p.connections = nil
+
+	close(p.available)
 }
 
-// createConnection creates a new Redis connection
+func (p *ConnectionPool) Stats() map[string]interface{} {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	total := len(p.connections)
+	inUse := 0
+	idle := 0
+
+	for _, conn := range p.connections {
+		if conn == nil {
+			continue
+		}
+		if conn.inUse {
+			inUse++
+		} else {
+			idle++
+		}
+	}
+
+	utilizationPct := float64(0)
+	if p.poolSize > 0 {
+		utilizationPct = float64(inUse) / float64(p.poolSize) * 100
+	}
+
+	return map[string]interface{}{
+		"total":       total,
+		"in_use":      inUse,
+		"idle":        idle,
+		"pending":     p.pendingCount,
+		"max_size":    p.poolSize,
+		"utilization": utilizationPct,
+	}
+}
+
 func (p *ConnectionPool) createConnection() (*Connection, error) {
-	// If TLS is enabled, use TLS connection
-	if p.tlsEnabled {
-		return p.createTLSConnection()
-	}
-	return p.createPlainConnection()
-}
+	var conn net.Conn
+	var err error
 
-// createTLSConnection creates a new TLS Redis connection
-func (p *ConnectionPool) createTLSConnection() (*Connection, error) {
-	// Use tls.Dial to establish TLS connection
-	dialer := &net.Dialer{
-		Timeout: 5 * time.Second,
+	if p.tlsMode == "disabled" {
+		conn, err = net.DialTimeout("tcp", p.redisAddr, redisConnectTimeout)
+		if err != nil {
+			logJSON("ERROR", "failed to connect to Redis", map[string]interface{}{
+				"address": p.redisAddr,
+				"error":   err.Error(),
+			})
+			return nil, fmt.Errorf("connect to %s: %w", p.redisAddr, err)
+		}
+	} else {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: p.tlsMode == "insecure",
+		}
+		dialer := &net.Dialer{Timeout: redisConnectTimeout}
+		conn, err = tls.DialWithDialer(dialer, "tcp", p.redisAddr, tlsConfig)
+		if err != nil {
+			logJSON("ERROR", "failed to connect to Redis with TLS", map[string]interface{}{
+				"address": p.redisAddr,
+				"error":   err.Error(),
+			})
+			return nil, fmt.Errorf("connect with TLS to %s: %w", p.redisAddr, err)
+		}
 	}
 
-	conn, err := tls.DialWithDialer(dialer, "tcp", p.redisAddr, p.tlsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("TLS connection failed: %v", err)
-	}
+	setTCPKeepAlive(conn)
 
-	// Perform TLS handshake
-	if err := conn.Handshake(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("TLS handshake failed: %v", err)
-	}
-
-	// Authenticate if password is set
 	if p.redisPassword != "" {
 		var authCmd string
 		if p.redisUsername != "" {
-			// AUTH username password (Redis 6+)
 			authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
 				len(p.redisUsername), p.redisUsername,
 				len(p.redisPassword), p.redisPassword)
 		} else {
-			// AUTH password (Redis < 6)
 			authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(p.redisPassword), p.redisPassword)
 		}
-		_, err = conn.Write([]byte(authCmd))
+
+		_, err = writeWithTimeout(conn, []byte(authCmd))
 		if err != nil {
+			logJSON("ERROR", "failed to write AUTH command", map[string]interface{}{
+				"error": err.Error(),
+			})
 			conn.Close()
-			return nil, fmt.Errorf("failed to send auth command: %v", err)
+			return nil, fmt.Errorf("send auth command: %w", err)
 		}
 
-		// Read auth response
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
+		buf := getSmallBuf()
+		defer putSmallBuf(buf)
+		n, err := readWithTimeout(conn, buf)
 		if err != nil {
+			logJSON("ERROR", "failed to read AUTH response", map[string]interface{}{
+				"error": err.Error(),
+			})
 			conn.Close()
-			return nil, fmt.Errorf("failed to read auth response: %v", err)
+			return nil, fmt.Errorf("read auth response: %w", err)
 		}
 
 		if !strings.Contains(string(buf[:n]), "+OK") {
@@ -1046,175 +1412,12 @@ func (p *ConnectionPool) createTLSConnection() (*Connection, error) {
 		conn:     conn,
 		lastUsed: time.Now(),
 		inUse:    false,
-		isTLS:    true,
 	}, nil
 }
 
-// createPlainConnection creates a new plain (non-TLS) Redis connection
-func (p *ConnectionPool) createPlainConnection() (*Connection, error) {
-	// Parse host and port
-	host, portStr, err := net.SplitHostPort(p.redisAddr)
-	if err != nil {
-		return nil, err
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Resolve hostname to IP
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return nil, err
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no IPs found for host %s", host)
-	}
-
-	// Use the first IP (prefer IPv4)
-	var ip net.IP
-	for _, i := range ips {
-		if i.To4() != nil {
-			ip = i.To4()
-			break
-		}
-	}
-	if ip == nil {
-		ip = ips[0]
-	}
-
-	// Create socket using syscall
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create socket: %v", err)
-	}
-
-	// Set socket to non-blocking for timeout support
-	if err := syscall.SetNonblock(fd, true); err != nil {
-		syscall.Close(fd)
-		return nil, err
-	}
-
-	// Create sockaddr
-	sa := &syscall.SockaddrInet4{
-		Port: port,
-	}
-	copy(sa.Addr[:], ip.To4())
-
-	// Connect (will return EINPROGRESS for non-blocking socket)
-	err = syscall.Connect(fd, sa)
-	if err != nil && err != syscall.EINPROGRESS {
-		syscall.Close(fd)
-		return nil, err
-	}
-
-	// Wait for connection with timeout using select
-	if err == syscall.EINPROGRESS {
-		fdSet := &syscall.FdSet{}
-		fdSet.Bits[fd/64] |= 1 << (uint(fd) % 64)
-
-		if err := selectWithTimeout(fd, fdSet, 5*time.Second); err != nil {
-			syscall.Close(fd)
-			return nil, err
-		}
-
-		// Check if the socket is writable (connection succeeded or failed)
-		if (fdSet.Bits[fd/64] & (1 << (uint(fd) % 64))) == 0 {
-			syscall.Close(fd)
-			return nil, fmt.Errorf("connection timeout")
-		}
-
-		// Check if connection succeeded
-		soErr, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
-		if err != nil {
-			syscall.Close(fd)
-			return nil, err
-		}
-		if soErr != 0 {
-			syscall.Close(fd)
-			return nil, syscall.Errno(soErr)
-		}
-	}
-
-	// Set socket back to blocking mode
-	if err := syscall.SetNonblock(fd, false); err != nil {
-		syscall.Close(fd)
-		return nil, err
-	}
-
-	// Enable TCP keepalive for connection health monitoring
-	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1); err != nil {
-		log.Printf("[ORGID-AUTH] Warning: failed to set TCP keepalive: %v", err)
-		// Don't fail connection creation for this
-	}
-
-	// Authenticate if password is set
-	if p.redisPassword != "" {
-		var authCmd string
-		if p.redisUsername != "" {
-			// AUTH username password (Redis 6+)
-			authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-				len(p.redisUsername), p.redisUsername,
-				len(p.redisPassword), p.redisPassword)
-		} else {
-			// AUTH password (Redis < 6)
-			authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(p.redisPassword), p.redisPassword)
-		}
-		_, err = syscall.Write(fd, []byte(authCmd))
-		if err != nil {
-			syscall.Close(fd)
-			return nil, fmt.Errorf("failed to send auth command: %v", err)
-		}
-
-		// Read auth response
-		buf := make([]byte, 1024)
-		n, err := syscall.Read(fd, buf)
-		if err != nil {
-			syscall.Close(fd)
-			return nil, fmt.Errorf("failed to read auth response: %v", err)
-		}
-
-		if !strings.Contains(string(buf[:n]), "+OK") {
-			syscall.Close(fd)
-			return nil, fmt.Errorf("authentication failed")
-		}
-	}
-
-	return &Connection{
-		fd:       fd,
-		lastUsed: time.Now(),
-		inUse:    false,
-		isTLS:    false,
-	}, nil
-}
-
-// connRead reads from a connection (TLS or non-TLS)
-func connRead(conn *Connection, buf []byte) (int, error) {
-	if conn.isTLS {
-		return conn.conn.Read(buf)
-	}
-	return syscall.Read(conn.fd, buf)
-}
-
-// connWrite writes to a connection (TLS or non-TLS)
-func connWrite(conn *Connection, data []byte) (int, error) {
-	if conn.isTLS {
-		return conn.conn.Write(data)
-	}
-	return syscall.Write(conn.fd, data)
-}
-
-// connClose closes a connection (TLS or non-TLS)
-func connClose(conn *Connection) error {
-	if conn.isTLS {
-		if conn.conn != nil {
-			return conn.conn.Close()
-		}
-		return nil
-	}
-	if conn.fd > 0 {
-		return syscall.Close(conn.fd)
-	}
-	return nil
+	return b
 }

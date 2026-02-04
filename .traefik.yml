@@ -5,18 +5,18 @@ import: github.com/carlosvillanua/orgidauthplugin
 
 summary: "Plugin to validate client IP against organization-specific allowed IPs stored in Valkey/Redis"
 
-# Allow plugin to use unsafe and syscall packages for Redis connection management
-useUnsafe: true
-
 testData:
   redisAddr: "valkey-redis-master.traefik.svc.cluster.local:6379"
   redisUsername: "default"
   redisPassword: "traefik"
   orgHeader: "X-Org"
-  poolSize: 10
+  poolSize: 500
   maxConnIdleTime: "5m"
-  poolWaitTimeout: "2s"
-  cacheTTL: "30s"
-  cacheMaxSize: 1000
-  tlsEnabled: false
-  tlsInsecureSkipVerify: false
+  poolWaitTimeout: "500ms"
+  cacheTTL: "10m"
+  cacheMaxSize: 100000
+  clusterMode: true
+  tlsMode: "secure"
+  keyPrefix: "uuid"
+  failOpen: true
+  requestTimeout: "5s"
