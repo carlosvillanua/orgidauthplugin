@@ -1,4 +1,4 @@
-package orgauthplugin
+package orgidauthplugin
 
 import (
 	"bufio"
