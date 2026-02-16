@@ -1,4 +1,4 @@
-package orgidauthplugin
+package orgauthplugin
 
 import (
 	"bufio"
@@ -78,7 +78,7 @@ func logJSON(level, msg string, fields map[string]interface{}) {
 		"time":   time.Now().UTC().Format(time.RFC3339),
 		"level":  level,
 		"msg":    msg,
-		"logger": "benji",
+		"logger": "orgidauthplugin",
 	}
 	for k, v := range fields {
 		entry[k] = v
@@ -103,6 +103,7 @@ type Config struct {
 	KeyPrefix       string `json:"keyPrefix,omitempty"`
 	FailOpen        bool   `json:"failOpen,omitempty"`
 	RequestTimeout  string `json:"requestTimeout,omitempty"`
+	Global          bool   `json:"global,omitempty"`
 }
 
 func CreateConfig() *Config {
@@ -218,6 +219,7 @@ type OrgIDAuth struct {
 	keyPrefix         string
 	failOpen          bool
 	requestTimeout    time.Duration
+	global            bool
 }
 
 const (
@@ -406,6 +408,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		keyPrefix:         config.KeyPrefix,
 		failOpen:          config.FailOpen,
 		requestTimeout:    requestTimeout,
+		global:            config.Global,
 	}, nil
 }
 
@@ -425,7 +428,7 @@ func (o *OrgIDAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	default:
 	}
 
-	clientIP := getClientIP(req)
+	clientIP := o.getClientIP(req)
 
 	orgHeaders := req.Header.Values(o.orgHeader)
 	var orgIDs []string
@@ -481,6 +484,7 @@ func (o *OrgIDAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			o.next.ServeHTTP(rw, req)
 			return
 		}
+
 	}
 
 	http.Error(rw, "IP not allowed for any organization", http.StatusForbidden)
@@ -658,9 +662,6 @@ func (o *OrgIDAuth) redisKeysSingleNode(conn net.Conn, pattern string) []string 
 	cmd := fmt.Sprintf("*2\r\n$4\r\nKEYS\r\n$%d\r\n%s\r\n", len(pattern), pattern)
 	_, err := writeWithTimeout(conn, []byte(cmd))
 	if err != nil {
-		logJSON("ERROR", "failed to write KEYS command", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return nil
 	}
 
@@ -668,9 +669,6 @@ func (o *OrgIDAuth) redisKeysSingleNode(conn net.Conn, pattern string) []string 
 	defer putMediumBuf(buf)
 	n, err := readWithTimeout(conn, buf)
 	if err != nil {
-		logJSON("ERROR", "failed to read KEYS response", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return nil
 	}
 
@@ -680,26 +678,17 @@ func (o *OrgIDAuth) redisKeysSingleNode(conn net.Conn, pattern string) []string 
 	reader := bufio.NewReader(bytes.NewReader(dataCopy))
 	response, err := reader.ReadString('\n')
 	if err != nil {
-		logJSON("ERROR", "failed to parse KEYS response", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return nil
 	}
 
 	response = strings.TrimSpace(response)
 	if !strings.HasPrefix(response, "*") {
-		logJSON("ERROR", "invalid KEYS response format", map[string]interface{}{
-			"response": response,
-		})
 		return nil
 	}
 
 	countStr := response[1:]
 	count, err := strconv.Atoi(countStr)
 	if err != nil {
-		logJSON("ERROR", "failed to parse KEYS count", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return nil
 	}
 	if count == 0 {
@@ -762,9 +751,6 @@ func (o *OrgIDAuth) getClusterNodes(conn net.Conn) []string {
 	cmd := "*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n"
 	_, err := writeWithTimeout(conn, []byte(cmd))
 	if err != nil {
-		logJSON("ERROR", "failed to write CLUSTER NODES command", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return nil
 	}
 
@@ -772,18 +758,12 @@ func (o *OrgIDAuth) getClusterNodes(conn net.Conn) []string {
 	defer putLargeBuf(buf)
 	n, err := readWithTimeout(conn, buf)
 	if err != nil {
-		logJSON("ERROR", "failed to read CLUSTER NODES response", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return nil
 	}
 
 	response := string(buf[:n])
 
 	if !strings.HasPrefix(response, "$") {
-		logJSON("ERROR", "invalid CLUSTER NODES response format", map[string]interface{}{
-			"response": response[:min(100, len(response))],
-		})
 		return nil
 	}
 
@@ -895,11 +875,6 @@ func (o *OrgIDAuth) redisSIsMember(conn net.Conn, key, member string) bool {
 		len(key), key, len(member), member)
 	_, err := writeWithTimeout(conn, []byte(cmd))
 	if err != nil {
-		logJSON("ERROR", "failed to write SISMEMBER command", map[string]interface{}{
-			"key":    key,
-			"member": member,
-			"error":  err.Error(),
-		})
 		return false
 	}
 
@@ -907,18 +882,12 @@ func (o *OrgIDAuth) redisSIsMember(conn net.Conn, key, member string) bool {
 	defer putSmallBuf(buf)
 	n, err := readWithTimeout(conn, buf)
 	if err != nil {
-		logJSON("ERROR", "failed to read SISMEMBER response", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return false
 	}
 
 	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
 	response, err := reader.ReadString('\n')
 	if err != nil {
-		logJSON("ERROR", "failed to parse SISMEMBER response", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return false
 	}
 
@@ -938,10 +907,6 @@ func (o *OrgIDAuth) redisExists(conn net.Conn, key string) int {
 	cmd := fmt.Sprintf("*2\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key)
 	_, err := writeWithTimeout(conn, []byte(cmd))
 	if err != nil {
-		logJSON("ERROR", "failed to write EXISTS command", map[string]interface{}{
-			"key":   key,
-			"error": err.Error(),
-		})
 		return -1
 	}
 
@@ -949,18 +914,12 @@ func (o *OrgIDAuth) redisExists(conn net.Conn, key string) int {
 	defer putSmallBuf(buf)
 	n, err := readWithTimeout(conn, buf)
 	if err != nil {
-		logJSON("ERROR", "failed to read EXISTS response", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return -1
 	}
 
 	reader := bufio.NewReader(bytes.NewReader(buf[:n]))
 	response, err := reader.ReadString('\n')
 	if err != nil {
-		logJSON("ERROR", "failed to parse EXISTS response", map[string]interface{}{
-			"error": err.Error(),
-		})
 		return -1
 	}
 
@@ -982,18 +941,42 @@ func (o *OrgIDAuth) redisExists(conn net.Conn, key string) int {
 	return -1
 }
 
-func getClientIP(req *http.Request) string {
-	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			clientIP := strings.TrimSpace(ips[0])
-			if clientIP != "" && isValidIP(clientIP) {
-				return clientIP
+func getHeaderCaseInsensitive(headers http.Header, name string) string {
+	lower := strings.ToLower(name)
+	for k, v := range headers {
+		if strings.ToLower(k) == lower && len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
+}
+
+func (o *OrgIDAuth) getClientIP(req *http.Request) string {
+	if o.global {
+		if fwd := getHeaderCaseInsensitive(req.Header, "forwarded"); fwd != "" {
+			for _, part := range strings.Split(fwd, ";") {
+				part = strings.TrimSpace(part)
+				lower := strings.ToLower(part)
+				if strings.HasPrefix(lower, "for=") {
+					ip := part[4:]
+					ip = strings.Trim(ip, `"`)
+					if bracketIdx := strings.Index(ip, "["); bracketIdx >= 0 {
+						if endBracket := strings.Index(ip, "]"); endBracket > bracketIdx {
+							ip = ip[bracketIdx+1 : endBracket]
+						}
+					}
+					if host, _, err := net.SplitHostPort(ip); err == nil {
+						ip = host
+					}
+					if isValidIP(ip) {
+						return ip
+					}
+				}
 			}
 		}
 	}
 
-	if xri := req.Header.Get("X-Real-IP"); xri != "" && isValidIP(xri) {
+	if xri := getHeaderCaseInsensitive(req.Header, "x-real-ip"); xri != "" && isValidIP(xri) {
 		return xri
 	}
 
@@ -1116,6 +1099,10 @@ func (c *OrgAllowlistCache) set(orgID string, members []string, expiresAt time.T
 	parsedCIDRs := make([]*net.IPNet, 0)
 
 	for _, member := range members {
+		member = strings.TrimSpace(member)
+		if member == "" {
+			continue
+		}
 		if strings.Contains(member, "/") {
 			_, ipnet, err := net.ParseCIDR(member)
 			if err != nil {
@@ -1223,9 +1210,6 @@ func (p *ConnectionPool) getConnectionWithContext(ctx context.Context) (*Connect
 			p.pendingCount--
 			if err != nil {
 				p.mutex.Unlock()
-				logJSON("ERROR", "failed to create connection", map[string]interface{}{
-					"error": err.Error(),
-				})
 				return nil, fmt.Errorf("create connection: %w", err)
 			}
 			conn.inUse = true
@@ -1349,10 +1333,6 @@ func (p *ConnectionPool) createConnection() (*Connection, error) {
 	if p.tlsMode == "disabled" {
 		conn, err = net.DialTimeout("tcp", p.redisAddr, redisConnectTimeout)
 		if err != nil {
-			logJSON("ERROR", "failed to connect to Redis", map[string]interface{}{
-				"address": p.redisAddr,
-				"error":   err.Error(),
-			})
 			return nil, fmt.Errorf("connect to %s: %w", p.redisAddr, err)
 		}
 	} else {
@@ -1362,10 +1342,6 @@ func (p *ConnectionPool) createConnection() (*Connection, error) {
 		dialer := &net.Dialer{Timeout: redisConnectTimeout}
 		conn, err = tls.DialWithDialer(dialer, "tcp", p.redisAddr, tlsConfig)
 		if err != nil {
-			logJSON("ERROR", "failed to connect to Redis with TLS", map[string]interface{}{
-				"address": p.redisAddr,
-				"error":   err.Error(),
-			})
 			return nil, fmt.Errorf("connect with TLS to %s: %w", p.redisAddr, err)
 		}
 	}
@@ -1384,9 +1360,6 @@ func (p *ConnectionPool) createConnection() (*Connection, error) {
 
 		_, err = writeWithTimeout(conn, []byte(authCmd))
 		if err != nil {
-			logJSON("ERROR", "failed to write AUTH command", map[string]interface{}{
-				"error": err.Error(),
-			})
 			conn.Close()
 			return nil, fmt.Errorf("send auth command: %w", err)
 		}
@@ -1395,9 +1368,6 @@ func (p *ConnectionPool) createConnection() (*Connection, error) {
 		defer putSmallBuf(buf)
 		n, err := readWithTimeout(conn, buf)
 		if err != nil {
-			logJSON("ERROR", "failed to read AUTH response", map[string]interface{}{
-				"error": err.Error(),
-			})
 			conn.Close()
 			return nil, fmt.Errorf("read auth response: %w", err)
 		}
