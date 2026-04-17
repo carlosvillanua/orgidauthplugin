@@ -89,21 +89,22 @@ func logJSON(level, msg string, fields map[string]interface{}) {
 }
 
 type Config struct {
-	RedisAddr       string `json:"redisAddr,omitempty"`
-	RedisUsername   string `json:"redisUsername,omitempty"`
-	RedisPassword   string `json:"redisPassword,omitempty"`
-	OrgHeader       string `json:"orgHeader,omitempty"`
-	PoolSize        int    `json:"poolSize,omitempty"`
-	MaxConnIdleTime string `json:"maxConnIdleTime,omitempty"`
-	PoolWaitTimeout string `json:"poolWaitTimeout,omitempty"`
-	CacheTTL        string `json:"cacheTTL,omitempty"`
-	CacheMaxSize    int    `json:"cacheMaxSize,omitempty"`
-	ClusterMode     bool   `json:"clusterMode,omitempty"`
-	TLSMode         string `json:"tlsMode,omitempty"`
-	KeyPrefix       string `json:"keyPrefix,omitempty"`
-	FailOpen        bool   `json:"failOpen,omitempty"`
-	RequestTimeout  string `json:"requestTimeout,omitempty"`
-	Global          bool   `json:"global,omitempty"`
+	RedisAddr             string `json:"redisAddr,omitempty"`
+	RedisUsername         string `json:"redisUsername,omitempty"`
+	RedisPassword         string `json:"redisPassword,omitempty"`
+	OrgHeader             string `json:"orgHeader,omitempty"`
+	PoolSize              int    `json:"poolSize,omitempty"`
+	MaxConnIdleTime       string `json:"maxConnIdleTime,omitempty"`
+	PoolWaitTimeout       string `json:"poolWaitTimeout,omitempty"`
+	CacheTTL              string `json:"cacheTTL,omitempty"`
+	CacheMaxSize          int    `json:"cacheMaxSize,omitempty"`
+	ClusterMode           bool   `json:"clusterMode,omitempty"`
+	TLSMode               string `json:"tlsMode,omitempty"`
+	KeyPrefix             string `json:"keyPrefix,omitempty"`
+	FailOpen              bool   `json:"failOpen,omitempty"`
+	RequestTimeout        string `json:"requestTimeout,omitempty"`
+	Global                bool   `json:"global,omitempty"`
+	TrustCloudflareHeader bool   `json:"trustCloudflareHeader,omitempty"`
 }
 
 func CreateConfig() *Config {
@@ -208,18 +209,19 @@ type OrgAllowlistCache struct {
 }
 
 type OrgIDAuth struct {
-	next              http.Handler
-	orgHeader         string
-	name              string
-	pool              *ConnectionPool
-	cache             *IPCache
-	orgAllowlistCache *OrgAllowlistCache
-	clusterMode       bool
-	tlsMode           string
-	keyPrefix         string
-	failOpen          bool
-	requestTimeout    time.Duration
-	global            bool
+	next                  http.Handler
+	orgHeader             string
+	name                  string
+	pool                  *ConnectionPool
+	cache                 *IPCache
+	orgAllowlistCache     *OrgAllowlistCache
+	clusterMode           bool
+	tlsMode               string
+	keyPrefix             string
+	failOpen              bool
+	requestTimeout        time.Duration
+	global                bool
+	trustCloudflareHeader bool
 }
 
 const (
@@ -397,18 +399,19 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	return &OrgIDAuth{
-		next:              next,
-		orgHeader:         config.OrgHeader,
-		name:              name,
-		pool:              pool,
-		cache:             cache,
-		orgAllowlistCache: orgAllowlistCache,
-		clusterMode:       config.ClusterMode,
-		tlsMode:           config.TLSMode,
-		keyPrefix:         config.KeyPrefix,
-		failOpen:          config.FailOpen,
-		requestTimeout:    requestTimeout,
-		global:            config.Global,
+		next:                  next,
+		orgHeader:             config.OrgHeader,
+		name:                  name,
+		pool:                  pool,
+		cache:                 cache,
+		orgAllowlistCache:     orgAllowlistCache,
+		clusterMode:           config.ClusterMode,
+		tlsMode:               config.TLSMode,
+		keyPrefix:             config.KeyPrefix,
+		failOpen:              config.FailOpen,
+		requestTimeout:        requestTimeout,
+		global:                config.Global,
+		trustCloudflareHeader: config.TrustCloudflareHeader,
 	}, nil
 }
 
@@ -952,6 +955,12 @@ func getHeaderCaseInsensitive(headers http.Header, name string) string {
 }
 
 func (o *OrgIDAuth) getClientIP(req *http.Request) string {
+	if o.trustCloudflareHeader {
+		if cf := getHeaderCaseInsensitive(req.Header, "cf-connecting-ip"); cf != "" && isValidIP(cf) {
+			return cf
+		}
+	}
+
 	if o.global {
 		if fwd := getHeaderCaseInsensitive(req.Header, "forwarded"); fwd != "" {
 			for _, part := range strings.Split(fwd, ";") {
